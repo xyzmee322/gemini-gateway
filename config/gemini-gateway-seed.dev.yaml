@@ -1,0 +1,35 @@
+projects:
+  - label: local-dev
+    owner_name: Local Dev
+    model_limits:
+      - model: google/gemini-3.1-flash-lite
+        requests_per_minute: 60
+        tokens_per_minute: 100000
+        requests_per_day: 5000
+      - model: google/gemini-3.5-flash
+        requests_per_minute: 60
+        tokens_per_minute: 100000
+        requests_per_day: 5000
+      - model: google/gemini-3.1-flash-tts-preview
+        requests_per_minute: 20
+        tokens_per_minute: 50000
+        requests_per_day: 1000
+      - model: google/gemini-embedding-2
+        requests_per_minute: 60
+        tokens_per_minute: 100000
+        requests_per_day: 1000
+
+api_keys:
+  - project_label: local-dev
+    label: local-gemini-key
+    api_key: ${GEMINI_API_KEY}
+
+proxies:
+  - label: local-gemini-proxy
+    url: ${GEMINI_GATEWAY_PROXY_URL}
+
+bindings:
+  - label: local-proxy-route
+    project_label: local-dev
+    api_key_label: local-gemini-key
+    proxy_label: local-gemini-proxy

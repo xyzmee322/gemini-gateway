@@ -26,8 +26,7 @@ COPY --chown=appuser:appuser gemini_gateway ./gemini_gateway
 COPY --chown=appuser:appuser migrations ./migrations
 COPY --chown=appuser:appuser scripts ./scripts
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX}" \
+RUN UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX}" \
     UV_LINK_MODE=copy \
     uv pip install --system .
 

@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Any, Protocol
 
@@ -46,6 +46,21 @@ _MODEL_SCOPED_TRANSPORT_COOLDOWN_REASONS = frozenset({"network_timeout"})
 class _RouteSecrets:
     api_key: str
     proxy_url: str | None
+
+
+@dataclass(frozen=True)
+class _RouteAcquisitionDiagnostics:
+    """Сводка причины, почему маршрут сейчас нельзя выдать."""
+
+    reason: str
+    retry_after_seconds: int | None = None
+    quota_scope: str | None = None
+    quota_reset_at: datetime | None = None
+    eligible_routes_count: int | None = None
+    exhausted_routes_count: int | None = None
+    disabled_routes_count: int | None = None
+    cooldown_level: int | None = None
+    sleep_until: datetime | None = None
 
 
 class _RouteEligibilityQueryBuilder:
@@ -196,24 +211,28 @@ class InMemoryRouteRepository:
 
         async with self._lock:
             attempted_bindings = self._attempted_bindings_by_request.setdefault(_request_group_id(request), set())
-            candidates = [
+            model_routes = [
                 route
                 for route in self._routes.values()
+                if route.model == request.model and route.binding_id not in attempted_bindings
+            ]
+            candidates = [
+                route
+                for route in model_routes
                 if (
-                    route.model == request.model
-                    and route.transport_mode == "proxy"
+                    route.transport_mode == "proxy"
                     and route.proxy_url
-                    and route.binding_id not in attempted_bindings
                 )
             ]
             route = RouteScorer.choose(candidates, estimated_tokens, now)
             if route is None:
-                raise GatewayError(
-                    reason="no_route",
-                    request_id=request.request_id,
-                    retryable=True,
-                    retry_after_seconds=_next_in_memory_retry_after_seconds(candidates, now=now),
+                diagnostics = _route_unavailability_from_candidates(
+                    candidates=candidates,
+                    disabled_routes_count=max(len(model_routes) - len(candidates), 0),
+                    estimated_tokens=estimated_tokens,
+                    now=now,
                 )
+                raise _route_acquisition_error(request=request, diagnostics=diagnostics)
 
             route.minute_requests_used += 1
             route.minute_tokens_reserved += estimated_tokens
@@ -332,12 +351,15 @@ class PostgresGatewayRepository:
         now = datetime.now(tz=UTC)
         candidates = await self.list_route_candidates(request.model, now)
         attempted_binding_ids = await self._attempted_binding_ids(request=request)
+        skipped_by_attempt = False
         if attempted_binding_ids:
+            initial_count = len(candidates)
             candidates = [
                 candidate
                 for candidate in candidates
                 if str(candidate.binding_id) not in attempted_binding_ids
             ]
+            skipped_by_attempt = initial_count > 0 and not candidates
 
         while candidates:
             candidate = RouteScorer.choose(candidates, estimated_tokens, now)
@@ -353,23 +375,57 @@ class PostgresGatewayRepository:
                 return lease
             candidates = [item for item in candidates if item.binding_id != candidate.binding_id]
 
-        retry_after_seconds = await self._next_route_retry_after_seconds(
-            model=request.model,
+        if skipped_by_attempt:
+            diagnostics = _RouteAcquisitionDiagnostics(reason="no_route")
+        elif candidates:
+            diagnostics = _route_unavailability_from_candidates(
+                candidates=candidates,
+                disabled_routes_count=0,
+                estimated_tokens=estimated_tokens,
+                now=now,
+            )
+        else:
+            diagnostics = await self._route_unavailability_diagnostics(
+                model=request.model,
+                estimated_tokens=estimated_tokens,
+                now=now,
+            )
+        await self._record_skipped_route_unavailable(
+            request=request,
             estimated_tokens=estimated_tokens,
-            now=now,
+            reason=diagnostics.reason,
         )
-        await self._record_skipped_no_route(request=request, estimated_tokens=estimated_tokens)
-        raise GatewayError(
-            reason="no_route",
-            request_id=request.request_id,
-            retryable=True,
-            retry_after_seconds=retry_after_seconds,
-        )
+        raise _route_acquisition_error(request=request, diagnostics=diagnostics)
 
-    async def _next_route_retry_after_seconds(self, *, model: str, estimated_tokens: int, now: datetime) -> int | None:
+    async def _route_unavailability_diagnostics(
+        self,
+        *,
+        model: str,
+        estimated_tokens: int,
+        now: datetime,
+    ) -> _RouteAcquisitionDiagnostics:
         query = text(
             """
-            WITH route_base AS (
+            WITH all_model_routes AS (
+                SELECT
+                    b.id AS binding_id,
+                    (
+                        p.status = 'active'
+                        AND k.status = 'active'
+                        AND b.status = 'active'
+                        AND px.id IS NOT NULL
+                        AND px.status = 'active'
+                        AND ml.status = 'active'
+                        AND b.transport_mode = 'proxy'
+                    ) AS active_route
+                FROM gemini_gateway.key_proxy_bindings b
+                JOIN gemini_gateway.api_keys k ON k.id = b.api_key_id
+                LEFT JOIN gemini_gateway.proxy_endpoints px ON px.id = b.proxy_id
+                JOIN gemini_gateway.google_projects p ON p.id = k.project_id
+                LEFT JOIN gemini_gateway.model_limits ml ON ml.project_id = p.id AND ml.model = :model
+                WHERE ml.model = :model
+            ),
+            route_base AS (
                 SELECT
                     b.id AS binding_id,
                     p.id AS project_id,
@@ -387,7 +443,8 @@ class PostgresGatewayRepository:
                     k.sleep_until AS key_sleep_until,
                     b.sleep_until AS binding_sleep_until,
                     px.sleep_until AS proxy_sleep_until,
-                    active_cooldowns.cooldown_until
+                    active_cooldowns.cooldown_until,
+                    active_cooldowns.cooldown_level
                 FROM gemini_gateway.key_proxy_bindings b
                 JOIN gemini_gateway.api_keys k ON k.id = b.api_key_id
                 JOIN gemini_gateway.proxy_endpoints px ON px.id = b.proxy_id
@@ -404,7 +461,7 @@ class PostgresGatewayRepository:
                     AND qd.window_kind = 'day'
                     AND qd.window_start = date_trunc('day', CAST(:now AS timestamptz))
                 LEFT JOIN LATERAL (
-                    SELECT MAX(cd.sleep_until) AS cooldown_until
+                    SELECT MAX(cd.sleep_until) AS cooldown_until, MAX(cd.cooldown_level) AS cooldown_level
                     FROM gemini_gateway.cooldowns cd
                     WHERE cd.status = 'active'
                       AND cd.sleep_until > :now
@@ -431,7 +488,7 @@ class PostgresGatewayRepository:
                   AND ml.status = 'active'
                   AND b.transport_mode = 'proxy'
             ),
-            route_retry_after AS (
+            route_blocks AS (
                 SELECT
                     rb.binding_id,
                     (
@@ -441,6 +498,27 @@ class PostgresGatewayRepository:
                             AND :estimated_tokens > rb.tokens_per_day
                         )
                     ) AS permanently_too_large,
+                    (
+                        rb.key_sleep_until > :now
+                        OR rb.binding_sleep_until > :now
+                        OR rb.proxy_sleep_until > :now
+                        OR rb.cooldown_until > :now
+                    ) AS cooldown_blocked,
+                    (
+                        rb.minute_requests_used >= rb.requests_per_minute
+                        OR (
+                            :estimated_tokens <= rb.tokens_per_minute
+                            AND :estimated_tokens > GREATEST(rb.tokens_per_minute - rb.minute_tokens_reserved, 0)
+                        )
+                    ) AS minute_quota_blocked,
+                    (
+                        rb.day_requests_used >= rb.requests_per_day
+                        OR (
+                            rb.tokens_per_day IS NOT NULL
+                            AND :estimated_tokens <= rb.tokens_per_day
+                            AND :estimated_tokens > GREATEST(rb.tokens_per_day - rb.day_tokens_reserved, 0)
+                        )
+                    ) AS day_quota_blocked,
                     (
                         SELECT MAX(unblock_at)
                         FROM (
@@ -478,27 +556,154 @@ class PostgresGatewayRepository:
                                 )
                         ) AS route_blocks(unblock_at)
                         WHERE unblock_at IS NOT NULL
-                    ) AS retry_after_at
+                    ) AS retry_after_at,
+                    (
+                        SELECT block_reason
+                        FROM (
+                            VALUES
+                                (CASE WHEN rb.key_sleep_until > :now THEN rb.key_sleep_until END, 'cooldown_active'),
+                                (CASE WHEN rb.binding_sleep_until > :now THEN rb.binding_sleep_until END, 'cooldown_active'),
+                                (CASE WHEN rb.proxy_sleep_until > :now THEN rb.proxy_sleep_until END, 'cooldown_active'),
+                                (rb.cooldown_until, 'cooldown_active'),
+                                (
+                                    CASE
+                                        WHEN rb.minute_requests_used >= rb.requests_per_minute
+                                            THEN date_trunc('minute', CAST(:now AS timestamptz)) + interval '1 minute'
+                                    END,
+                                    'quota_exhausted'
+                                ),
+                                (
+                                    CASE
+                                        WHEN :estimated_tokens <= rb.tokens_per_minute
+                                             AND :estimated_tokens > GREATEST(rb.tokens_per_minute - rb.minute_tokens_reserved, 0)
+                                            THEN date_trunc('minute', CAST(:now AS timestamptz)) + interval '1 minute'
+                                    END,
+                                    'quota_exhausted'
+                                ),
+                                (
+                                    CASE
+                                        WHEN rb.day_requests_used >= rb.requests_per_day
+                                            THEN date_trunc('day', CAST(:now AS timestamptz)) + interval '1 day'
+                                    END,
+                                    'quota_exhausted'
+                                ),
+                                (
+                                    CASE
+                                        WHEN rb.tokens_per_day IS NOT NULL
+                                             AND :estimated_tokens <= rb.tokens_per_day
+                                             AND :estimated_tokens > GREATEST(rb.tokens_per_day - rb.day_tokens_reserved, 0)
+                                            THEN date_trunc('day', CAST(:now AS timestamptz)) + interval '1 day'
+                                    END,
+                                    'quota_exhausted'
+                                )
+                        ) AS route_block_reasons(unblock_at, block_reason)
+                        WHERE unblock_at IS NOT NULL
+                        ORDER BY unblock_at DESC
+                        LIMIT 1
+                    ) AS blocking_reason,
+                    (
+                        SELECT MAX(unblock_at)
+                        FROM (
+                            VALUES
+                                (CASE WHEN rb.key_sleep_until > :now THEN rb.key_sleep_until END),
+                                (CASE WHEN rb.binding_sleep_until > :now THEN rb.binding_sleep_until END),
+                                (CASE WHEN rb.proxy_sleep_until > :now THEN rb.proxy_sleep_until END),
+                                (rb.cooldown_until)
+                        ) AS cooldown_blocks(unblock_at)
+                        WHERE unblock_at IS NOT NULL
+                    ) AS cooldown_until,
+                    (
+                        SELECT MAX(unblock_at)
+                        FROM (
+                            VALUES
+                                (
+                                    CASE
+                                        WHEN rb.minute_requests_used >= rb.requests_per_minute
+                                            THEN date_trunc('minute', CAST(:now AS timestamptz)) + interval '1 minute'
+                                    END
+                                ),
+                                (
+                                    CASE
+                                        WHEN :estimated_tokens <= rb.tokens_per_minute
+                                             AND :estimated_tokens > GREATEST(rb.tokens_per_minute - rb.minute_tokens_reserved, 0)
+                                            THEN date_trunc('minute', CAST(:now AS timestamptz)) + interval '1 minute'
+                                    END
+                                ),
+                                (
+                                    CASE
+                                        WHEN rb.day_requests_used >= rb.requests_per_day
+                                            THEN date_trunc('day', CAST(:now AS timestamptz)) + interval '1 day'
+                                    END
+                                ),
+                                (
+                                    CASE
+                                        WHEN rb.tokens_per_day IS NOT NULL
+                                             AND :estimated_tokens <= rb.tokens_per_day
+                                             AND :estimated_tokens > GREATEST(rb.tokens_per_day - rb.day_tokens_reserved, 0)
+                                            THEN date_trunc('day', CAST(:now AS timestamptz)) + interval '1 day'
+                                    END
+                                )
+                        ) AS quota_blocks(unblock_at)
+                        WHERE unblock_at IS NOT NULL
+                    ) AS quota_reset_at,
+                    rb.cooldown_level
                 FROM route_base rb
-            )
-            SELECT MIN(retry_after_at)
-            FROM route_retry_after
-            WHERE permanently_too_large = FALSE
-              AND retry_after_at IS NOT NULL
-              AND NOT EXISTS (
-                SELECT 1
-                FROM route_retry_after
+            ),
+            next_unblock AS (
+                SELECT blocking_reason, retry_after_at, quota_reset_at, cooldown_until, cooldown_level
+                FROM route_blocks
                 WHERE permanently_too_large = FALSE
-                  AND retry_after_at IS NULL
+                  AND retry_after_at IS NOT NULL
+                ORDER BY retry_after_at ASC
+                LIMIT 1
               )
+            SELECT
+                COALESCE((SELECT COUNT(*) FROM route_blocks WHERE permanently_too_large = FALSE), 0)
+                    AS eligible_routes_count,
+                COALESCE(
+                    (
+                        SELECT COUNT(*)
+                        FROM route_blocks
+                        WHERE permanently_too_large = FALSE
+                          AND (minute_quota_blocked OR day_quota_blocked)
+                    ),
+                    0
+                ) AS exhausted_routes_count,
+                COALESCE(
+                    (
+                        SELECT COUNT(*)
+                        FROM route_blocks
+                        WHERE permanently_too_large = FALSE
+                          AND cooldown_blocked
+                    ),
+                    0
+                ) AS cooldown_routes_count,
+                COALESCE((SELECT COUNT(*) FROM all_model_routes WHERE active_route = FALSE), 0)
+                    AS disabled_routes_count,
+                COALESCE(
+                    (
+                        SELECT COUNT(*)
+                        FROM route_blocks
+                        WHERE permanently_too_large = FALSE
+                          AND retry_after_at IS NULL
+                    ),
+                    0
+                ) AS reservable_routes_count,
+                (SELECT blocking_reason FROM next_unblock) AS blocking_reason,
+                (SELECT retry_after_at FROM next_unblock) AS retry_after_at,
+                (SELECT quota_reset_at FROM next_unblock) AS quota_reset_at,
+                (SELECT cooldown_until FROM next_unblock) AS sleep_until,
+                (SELECT cooldown_level FROM next_unblock) AS cooldown_level
             """
         )
         async with self._session_factory() as session:
-            sleep_until = await session.scalar(
-                query,
-                {"model": model, "estimated_tokens": estimated_tokens, "now": now},
-            )
-        return _retry_after_seconds_until(sleep_until, now=now)
+            row = (
+                await session.execute(
+                    query,
+                    {"model": model, "estimated_tokens": estimated_tokens, "now": now},
+                )
+            ).mappings().one()
+        return _route_unavailability_from_diagnostic_row(row, now=now)
 
     async def list_route_candidates(self, model: str, now: datetime) -> list[RouteCandidate]:
         query = text(
@@ -1038,7 +1243,13 @@ class PostgresGatewayRepository:
         except (SecretDecryptionError, ValueError):
             return None
 
-    async def _record_skipped_no_route(self, *, request: GatewayRouteRequest, estimated_tokens: int) -> None:
+    async def _record_skipped_route_unavailable(
+        self,
+        *,
+        request: GatewayRouteRequest,
+        estimated_tokens: int,
+        reason: str,
+    ) -> None:
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 text(
@@ -1065,7 +1276,7 @@ class PostgresGatewayRepository:
                         :telegram_message_id,
                         :model,
                         'skipped_no_route',
-                        'no_route',
+                        :reason,
                         :error_message_safe,
                         true,
                         :retry_count,
@@ -1080,7 +1291,8 @@ class PostgresGatewayRepository:
                     "chat_id": request.chat_id,
                     "telegram_message_id": request.telegram_message_id,
                     "model": request.model,
-                    "error_message_safe": public_message_for_reason("no_route"),
+                    "reason": reason,
+                    "error_message_safe": public_message_for_reason(reason),
                     "retry_count": int(request.retry_count or 0),
                     "estimated_tokens": estimated_tokens,
                 },
@@ -1904,15 +2116,222 @@ def _retry_after_seconds_until(sleep_until: datetime | None, *, now: datetime) -
     return max(1, seconds) if seconds > 0 else None
 
 
-def _next_in_memory_retry_after_seconds(candidates: list[RouteCandidate], *, now: datetime) -> int | None:
-    sleep_until_values = [
-        cooldown_until
-        for candidate in candidates
-        if (cooldown_until := _aware_or_none(candidate.cooldown_until)) is not None and cooldown_until > now
-    ]
-    if not sleep_until_values:
+def _route_unavailability_from_candidates(
+    *,
+    candidates: list[RouteCandidate],
+    disabled_routes_count: int,
+    estimated_tokens: int,
+    now: datetime,
+) -> _RouteAcquisitionDiagnostics:
+    if not candidates:
+        return _RouteAcquisitionDiagnostics(
+            reason="no_route",
+            disabled_routes_count=max(disabled_routes_count, 0),
+        )
+
+    quota_blocks: list[tuple[str, datetime]] = []
+    cooldown_blocks: list[datetime] = []
+    permanent_blocks = 0
+    for candidate in candidates:
+        if _candidate_request_is_permanently_too_large(candidate=candidate, estimated_tokens=estimated_tokens):
+            permanent_blocks += 1
+            continue
+        quota_block = _candidate_quota_block(candidate=candidate, estimated_tokens=estimated_tokens, now=now)
+        if quota_block is not None:
+            quota_blocks.append(quota_block)
+            continue
+        cooldown_until = _aware_or_none(candidate.cooldown_until)
+        if cooldown_until is not None and cooldown_until > now:
+            cooldown_blocks.append(cooldown_until)
+
+    eligible_routes_count = max(len(candidates) - permanent_blocks, 0)
+    if eligible_routes_count == 0:
+        return _RouteAcquisitionDiagnostics(
+            reason="no_route",
+            eligible_routes_count=0,
+            exhausted_routes_count=0,
+            disabled_routes_count=max(disabled_routes_count, 0),
+        )
+
+    if quota_blocks and len(quota_blocks) == eligible_routes_count:
+        quota_scope, quota_reset_at = min(quota_blocks, key=lambda item: item[1])
+        return _RouteAcquisitionDiagnostics(
+            reason="quota_exhausted",
+            retry_after_seconds=_retry_after_seconds_until(quota_reset_at, now=now),
+            quota_scope=quota_scope,
+            quota_reset_at=quota_reset_at,
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=len(quota_blocks),
+            disabled_routes_count=max(disabled_routes_count, 0),
+        )
+
+    if cooldown_blocks and len(cooldown_blocks) == eligible_routes_count:
+        sleep_until = min(cooldown_blocks)
+        return _RouteAcquisitionDiagnostics(
+            reason="cooldown_active",
+            retry_after_seconds=_retry_after_seconds_until(sleep_until, now=now),
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=len(quota_blocks),
+            disabled_routes_count=max(disabled_routes_count, 0),
+            sleep_until=sleep_until,
+        )
+
+    if quota_blocks or cooldown_blocks:
+        quota_scope, quota_reset_at = min(quota_blocks, key=lambda item: item[1]) if quota_blocks else (None, None)
+        sleep_until = min(cooldown_blocks) if cooldown_blocks else None
+        if quota_reset_at is not None and (sleep_until is None or quota_reset_at <= sleep_until):
+            return _RouteAcquisitionDiagnostics(
+                reason="quota_exhausted",
+                retry_after_seconds=_retry_after_seconds_until(quota_reset_at, now=now),
+                quota_scope=quota_scope,
+                quota_reset_at=quota_reset_at,
+                eligible_routes_count=eligible_routes_count,
+                exhausted_routes_count=len(quota_blocks),
+                disabled_routes_count=max(disabled_routes_count, 0),
+                sleep_until=sleep_until,
+            )
+        return _RouteAcquisitionDiagnostics(
+            reason="cooldown_active",
+            retry_after_seconds=_retry_after_seconds_until(sleep_until, now=now),
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=len(quota_blocks),
+            disabled_routes_count=max(disabled_routes_count, 0),
+            sleep_until=sleep_until,
+        )
+
+    return _RouteAcquisitionDiagnostics(
+        reason="no_route",
+        eligible_routes_count=eligible_routes_count,
+        exhausted_routes_count=0,
+        disabled_routes_count=max(disabled_routes_count, 0),
+    )
+
+
+def _route_unavailability_from_diagnostic_row(row: Any, *, now: datetime) -> _RouteAcquisitionDiagnostics:
+    eligible_routes_count = _non_negative_int(row.get("eligible_routes_count"))
+    exhausted_routes_count = _non_negative_int(row.get("exhausted_routes_count"))
+    disabled_routes_count = _non_negative_int(row.get("disabled_routes_count"))
+    cooldown_routes_count = _non_negative_int(row.get("cooldown_routes_count")) or 0
+    reservable_routes_count = _non_negative_int(row.get("reservable_routes_count")) or 0
+    blocking_reason = str(row.get("blocking_reason") or "no_route")
+    quota_reset_at = _aware_or_none(row.get("quota_reset_at"))
+    sleep_until = _aware_or_none(row.get("sleep_until"))
+    retry_after_at = _aware_or_none(row.get("retry_after_at"))
+    retry_after_seconds = _retry_after_seconds_until(retry_after_at, now=now)
+
+    if reservable_routes_count > 0 or eligible_routes_count == 0:
+        return _RouteAcquisitionDiagnostics(
+            reason="no_route",
+            retry_after_seconds=retry_after_seconds,
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=exhausted_routes_count,
+            disabled_routes_count=disabled_routes_count,
+            sleep_until=sleep_until,
+        )
+
+    if blocking_reason == "quota_exhausted" and exhausted_routes_count > 0:
+        return _RouteAcquisitionDiagnostics(
+            reason="quota_exhausted",
+            retry_after_seconds=_retry_after_seconds_until(quota_reset_at, now=now) or retry_after_seconds,
+            quota_scope=_quota_scope_from_reset_at(quota_reset_at, now=now),
+            quota_reset_at=quota_reset_at,
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=exhausted_routes_count,
+            disabled_routes_count=disabled_routes_count,
+            sleep_until=sleep_until,
+        )
+
+    if blocking_reason == "cooldown_active" and cooldown_routes_count > 0:
+        return _RouteAcquisitionDiagnostics(
+            reason="cooldown_active",
+            retry_after_seconds=_retry_after_seconds_until(sleep_until, now=now) or retry_after_seconds,
+            eligible_routes_count=eligible_routes_count,
+            exhausted_routes_count=exhausted_routes_count,
+            disabled_routes_count=disabled_routes_count,
+            cooldown_level=_non_negative_int(row.get("cooldown_level")),
+            sleep_until=sleep_until,
+        )
+
+    return _RouteAcquisitionDiagnostics(
+        reason="no_route",
+        retry_after_seconds=retry_after_seconds,
+        eligible_routes_count=eligible_routes_count,
+        exhausted_routes_count=exhausted_routes_count,
+        disabled_routes_count=disabled_routes_count,
+        sleep_until=sleep_until,
+    )
+
+
+def _route_acquisition_error(
+    *,
+    request: GatewayRouteRequest,
+    diagnostics: _RouteAcquisitionDiagnostics,
+) -> GatewayError:
+    return GatewayError(
+        reason=diagnostics.reason,
+        request_id=request.request_id,
+        retryable=True,
+        retry_after_seconds=diagnostics.retry_after_seconds,
+        error_code=diagnostics.reason if diagnostics.reason in {"quota_exhausted", "cooldown_active"} else None,
+        quota_scope=diagnostics.quota_scope,
+        quota_reset_at=diagnostics.quota_reset_at,
+        eligible_routes_count=diagnostics.eligible_routes_count,
+        exhausted_routes_count=diagnostics.exhausted_routes_count,
+        disabled_routes_count=diagnostics.disabled_routes_count,
+        cooldown_level=diagnostics.cooldown_level,
+        sleep_until=diagnostics.sleep_until,
+    )
+
+
+def _candidate_request_is_permanently_too_large(*, candidate: RouteCandidate, estimated_tokens: int) -> bool:
+    if estimated_tokens > candidate.tokens_per_minute:
+        return True
+    if candidate.tokens_per_day is not None and estimated_tokens > candidate.tokens_per_day:
+        return True
+    return False
+
+
+def _candidate_quota_block(
+    *,
+    candidate: RouteCandidate,
+    estimated_tokens: int,
+    now: datetime,
+) -> tuple[str, datetime] | None:
+    if candidate.day_requests_used >= candidate.requests_per_day:
+        return "day", _day_start(now) + timedelta(days=1)
+    if (
+        candidate.tokens_per_day is not None
+        and estimated_tokens <= candidate.tokens_per_day
+        and estimated_tokens > max(candidate.tokens_per_day - candidate.day_tokens_reserved, 0)
+    ):
+        return "day", _day_start(now) + timedelta(days=1)
+    if candidate.minute_requests_used >= candidate.requests_per_minute:
+        return "minute", _minute_start(now) + timedelta(minutes=1)
+    if (
+        estimated_tokens <= candidate.tokens_per_minute
+        and estimated_tokens > max(candidate.tokens_per_minute - candidate.minute_tokens_reserved, 0)
+    ):
+        return "minute", _minute_start(now) + timedelta(minutes=1)
+    return None
+
+
+def _quota_scope_from_reset_at(quota_reset_at: datetime | None, *, now: datetime) -> str | None:
+    if quota_reset_at is None:
         return None
-    return _retry_after_seconds_until(min(sleep_until_values), now=now)
+    day_reset_at = _day_start(now) + timedelta(days=1)
+    if abs((quota_reset_at - day_reset_at).total_seconds()) < 1:
+        return "day"
+    minute_reset_at = _minute_start(now) + timedelta(minutes=1)
+    if abs((quota_reset_at - minute_reset_at).total_seconds()) < 1:
+        return "minute"
+    return None
+
+
+def _non_negative_int(value: Any) -> int | None:
+    parsed = _safe_int(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
 
 
 def _should_apply_route_failure_state(*, error: GatewayError, provider_called: bool) -> bool:
@@ -1976,6 +2395,22 @@ def _safe_provider_failure_json(error: GatewayError) -> dict[str, Any]:
         payload["provider_reason"] = provider_reason
     if error.retry_after_seconds is not None:
         payload["retry_after_seconds"] = error.retry_after_seconds
+    for field_name in (
+        "error_code",
+        "quota_scope",
+        "eligible_routes_count",
+        "exhausted_routes_count",
+        "disabled_routes_count",
+        "cooldown_scope",
+        "cooldown_level",
+    ):
+        value = getattr(error, field_name, None)
+        if value is not None:
+            payload[field_name] = value
+    for field_name in ("quota_reset_at", "sleep_until"):
+        value = _serialize_diagnostic_time(getattr(error, field_name, None))
+        if value is not None:
+            payload[field_name] = value
     return payload
 
 
@@ -1983,6 +2418,15 @@ def _public_route_error_message(error: GatewayError) -> str:
     """Возвращает стабильный текст ошибки без provider-фрагментов."""
 
     return public_message_for_reason(error.reason)
+
+
+def _serialize_diagnostic_time(value: Any) -> str | None:
+    aware = _aware_or_none(value) if isinstance(value, datetime) else None
+    if aware is not None:
+        return aware.isoformat().replace("+00:00", "Z")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _minute_start(value: datetime) -> datetime:

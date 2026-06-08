@@ -11,6 +11,7 @@ from core.provider_metadata import allowlist_provider_metadata_tree, allowlist_p
 
 GatewayErrorReason = Literal[
     "no_route",
+    "cooldown_active",
     "rate_limited",
     "quota_exhausted",
     "auth_failed",
@@ -232,8 +233,17 @@ class GatewayErrorResponse(BaseModel):
     request_id: str
     error: str
     reason: GatewayErrorReason
+    error_code: str | None = None
     retryable: bool
     retry_after_seconds: int | None = Field(default=None, gt=0)
+    quota_scope: Literal["minute", "day"] | None = None
+    quota_reset_at: str | None = None
+    eligible_routes_count: int | None = Field(default=None, ge=0)
+    exhausted_routes_count: int | None = Field(default=None, ge=0)
+    disabled_routes_count: int | None = Field(default=None, ge=0)
+    cooldown_scope: str | None = None
+    cooldown_level: int | None = Field(default=None, ge=0)
+    sleep_until: str | None = None
     provider_reason: str | None = None
     provider_status_code: int | None = None
     route_label: str | None = None

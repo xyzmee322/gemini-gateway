@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from core.error_taxonomy import COMMON_PUBLIC_MESSAGES, retryable_by_default
-from core.number_parsing import parse_positive_int as _optional_positive_int
+from core.number_parsing import parse_optional_int as _optional_int, parse_positive_int as _optional_positive_int
 from core.secret_redaction import redact_secrets_in_text
 from core.string_parsing import parse_optional_string as _optional_string
 from gemini_gateway.contracts import GatewayErrorReason, GatewayErrorResponse
 
 _PUBLIC_MESSAGES: dict[GatewayErrorReason, str] = {
     "no_route": "Сейчас нет доступного маршрута для Gemini, попробуй позже",
+    "cooldown_active": "Маршруты Gemini временно охлаждаются, попробуй позже",
     "rate_limited": COMMON_PUBLIC_MESSAGES["rate_limited"],
     "quota_exhausted": "Квота Gemini временно исчерпана, попробуй позже",
     "auth_failed": COMMON_PUBLIC_MESSAGES["auth_failed"],
@@ -24,7 +26,7 @@ _PUBLIC_MESSAGES: dict[GatewayErrorReason, str] = {
     "bad_request": "Некорректный запрос",
 }
 
-_GATEWAY_RETRYABLE_OVERRIDES = frozenset({"no_route"})
+_GATEWAY_RETRYABLE_OVERRIDES = frozenset({"no_route", "cooldown_active"})
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 _PUBLIC_PROVIDER_REASON_MARKERS = (
     "content_filter",
@@ -70,6 +72,12 @@ class GatewayError(RuntimeError):
         retry_after_seconds: int | None = None,
         provider_called: bool | None = None,
         status_code: int | None = None,
+        error_code: str | None = None,
+        quota_scope: str | None = None,
+        quota_reset_at: Any | None = None,
+        eligible_routes_count: int | None = None,
+        exhausted_routes_count: int | None = None,
+        disabled_routes_count: int | None = None,
         cooldown_scope: str | None = None,
         cooldown_level: int | None = None,
         sleep_until: Any | None = None,
@@ -90,8 +98,14 @@ class GatewayError(RuntimeError):
         self.retry_after_seconds = _optional_positive_int(retry_after_seconds)
         self.provider_called = provider_called if provider_called is not None else self.provider_status_code is not None
         self.status_code = status_code or status_code_for_reason(reason, self.provider_status_code)
+        self.error_code = _optional_string(error_code) or _default_error_code(reason)
+        self.quota_scope = quota_scope if quota_scope in {"minute", "day"} else None
+        self.quota_reset_at = quota_reset_at
+        self.eligible_routes_count = _optional_non_negative_int(eligible_routes_count)
+        self.exhausted_routes_count = _optional_non_negative_int(exhausted_routes_count)
+        self.disabled_routes_count = _optional_non_negative_int(disabled_routes_count)
         self.cooldown_scope = cooldown_scope
-        self.cooldown_level = cooldown_level
+        self.cooldown_level = _optional_non_negative_int(cooldown_level)
         self.sleep_until = sleep_until
         self.route_label = _optional_string(route_label)
         self.project_label = _optional_string(project_label)
@@ -105,8 +119,17 @@ class GatewayError(RuntimeError):
             request_id=self.request_id,
             error=self.public_message,
             reason=self.reason,
+            error_code=self.error_code,
             retryable=self.retryable,
             retry_after_seconds=self.retry_after_seconds,
+            quota_scope=self.quota_scope,
+            quota_reset_at=_serialize_gateway_time(self.quota_reset_at),
+            eligible_routes_count=self.eligible_routes_count,
+            exhausted_routes_count=self.exhausted_routes_count,
+            disabled_routes_count=self.disabled_routes_count,
+            cooldown_scope=self.cooldown_scope,
+            cooldown_level=self.cooldown_level,
+            sleep_until=_serialize_gateway_time(self.sleep_until),
             provider_reason=public_provider_reason(self.provider_message_safe),
             provider_status_code=self.provider_status_code,
             route_label=self.route_label,
@@ -132,7 +155,7 @@ def status_code_for_reason(reason: GatewayErrorReason | str, provider_code: int 
         return 400
     if reason == "invalid_response":
         return 502
-    if reason in {"rate_limited", "quota_exhausted", "no_route"}:
+    if reason in {"rate_limited", "quota_exhausted", "cooldown_active", "no_route"}:
         return 429
     if reason == "content_filtered":
         return 400
@@ -240,3 +263,26 @@ def _looks_like_content_filter(message: str) -> bool:
 
 def _looks_like_auth_error(message: str) -> bool:
     return any(marker in message for marker in _AUTH_ERROR_MARKERS)
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    parsed = _optional_int(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def _default_error_code(reason: GatewayErrorReason | str) -> str | None:
+    if reason in {"quota_exhausted", "cooldown_active"}:
+        return str(reason)
+    return None
+
+
+def _serialize_gateway_time(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        text = aware.astimezone(UTC).isoformat()
+        return text.replace("+00:00", "Z")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None

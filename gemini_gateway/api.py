@@ -109,6 +109,7 @@ def create_app(
                 provider_status_code=error.provider_status_code,
                 retry_after_seconds=_gateway_error_retry_after_seconds(error),
                 route_context=_gateway_error_route_context(error),
+                diagnostics=_gateway_error_diagnostics(error),
             )
         except Exception as exc:
             _log_gateway_api_error(
@@ -169,6 +170,7 @@ def create_app(
                 provider_status_code=error.provider_status_code,
                 retry_after_seconds=_gateway_error_retry_after_seconds(error),
                 route_context=_gateway_error_route_context(error),
+                diagnostics=_gateway_error_diagnostics(error),
             )
         except Exception as exc:
             _log_gateway_api_error(
@@ -229,6 +231,7 @@ def create_app(
                 provider_status_code=error.provider_status_code,
                 retry_after_seconds=_gateway_error_retry_after_seconds(error),
                 route_context=_gateway_error_route_context(error),
+                diagnostics=_gateway_error_diagnostics(error),
             )
         except Exception as exc:
             _log_gateway_api_error(
@@ -348,6 +351,7 @@ def _error_response(
     provider_status_code: int | None = None,
     retry_after_seconds: int | None = None,
     route_context: dict[str, str | None] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> JSONResponse:
     content = {
         "request_id": request_id,
@@ -361,6 +365,8 @@ def _error_response(
         content["provider_status_code"] = provider_status_code
     if retry_after_seconds is not None and retry_after_seconds > 0:
         content["retry_after_seconds"] = retry_after_seconds
+    if diagnostics:
+        content.update({key: value for key, value in diagnostics.items() if value is not None})
     if route_context:
         content.update({key: value for key, value in route_context.items() if value is not None})
     return JSONResponse(
@@ -376,6 +382,20 @@ def _gateway_error_route_context(error: GatewayError) -> dict[str, str | None]:
         "key_label": _optional_string(getattr(error, "key_label", None)),
         "proxy_label": _optional_string(getattr(error, "proxy_label", None)),
         "transport_mode": _optional_string(getattr(error, "transport_mode", None)),
+    }
+
+
+def _gateway_error_diagnostics(error: GatewayError) -> dict[str, Any]:
+    return {
+        "error_code": _optional_string(getattr(error, "error_code", None)),
+        "quota_scope": _optional_string(getattr(error, "quota_scope", None)),
+        "quota_reset_at": _serialize_error_time(getattr(error, "quota_reset_at", None)),
+        "eligible_routes_count": _optional_non_negative_int(getattr(error, "eligible_routes_count", None)),
+        "exhausted_routes_count": _optional_non_negative_int(getattr(error, "exhausted_routes_count", None)),
+        "disabled_routes_count": _optional_non_negative_int(getattr(error, "disabled_routes_count", None)),
+        "cooldown_scope": _optional_string(getattr(error, "cooldown_scope", None)),
+        "cooldown_level": _optional_non_negative_int(getattr(error, "cooldown_level", None)),
+        "sleep_until": _serialize_error_time(getattr(error, "sleep_until", None)),
     }
 
 
@@ -399,3 +419,22 @@ def _dump(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {key: item for key, item in vars(value).items() if item is not None}
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _serialize_error_time(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None

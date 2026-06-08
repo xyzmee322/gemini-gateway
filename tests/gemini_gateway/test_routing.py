@@ -28,6 +28,8 @@ def _candidate(
     api_key: str = "AIza-key",
     proxy_url: str = "http://user:pass@127.0.0.1:8000",
     minute_tokens_reserved: int = 0,
+    day_requests_used: int = 0,
+    day_tokens_reserved: int = 0,
     cooldown_until: datetime | None = None,
     half_open: bool = False,
 ) -> RouteCandidate:
@@ -48,8 +50,9 @@ def _candidate(
         requests_per_day=100,
         minute_requests_used=0,
         minute_tokens_reserved=minute_tokens_reserved,
-        day_requests_used=0,
+        day_requests_used=day_requests_used,
         cooldown_until=cooldown_until,
+        day_tokens_reserved=day_tokens_reserved,
         half_open=half_open,
     )
 
@@ -222,6 +225,57 @@ async def test_in_memory_repository_rejects_proxy_route_without_proxy_url() -> N
         await repository.acquire_route(request)
 
     assert exc_info.value.reason == "no_route"
+
+
+@pytest.mark.asyncio
+async def test_in_memory_repository_reports_quota_exhausted_when_active_routes_hit_daily_limit() -> None:
+    repository = InMemoryRouteRepository([_candidate("daily-quota", day_requests_used=100)])
+    request = GatewayChatRequest(
+        request_id="req-quota-exhausted",
+        source_service="test",
+        model="gemini-3.5-flash",
+        messages=[{"role": "user", "content": "hello"}],
+        estimated_input_tokens=100,
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await repository.acquire_route(request)
+
+    error = exc_info.value
+    assert error.reason == "quota_exhausted"
+    assert error.retryable is True
+    assert error.error_code == "quota_exhausted"
+    assert error.quota_scope == "day"
+    assert error.retry_after_seconds is not None
+    assert error.quota_reset_at is not None
+    assert error.eligible_routes_count == 1
+    assert error.exhausted_routes_count == 1
+    assert error.disabled_routes_count == 0
+
+
+@pytest.mark.asyncio
+async def test_in_memory_repository_reports_cooldown_active_when_routes_are_sleeping() -> None:
+    cooldown_until = datetime.now(tz=UTC) + timedelta(minutes=5)
+    repository = InMemoryRouteRepository([_candidate("cooling", cooldown_until=cooldown_until)])
+    request = GatewayChatRequest(
+        request_id="req-cooldown-active",
+        source_service="test",
+        model="gemini-3.5-flash",
+        messages=[{"role": "user", "content": "hello"}],
+        estimated_input_tokens=100,
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await repository.acquire_route(request)
+
+    error = exc_info.value
+    assert error.reason == "cooldown_active"
+    assert error.error_code == "cooldown_active"
+    assert error.retryable is True
+    assert error.retry_after_seconds is not None
+    assert error.sleep_until is not None
+    assert error.eligible_routes_count == 1
+    assert error.exhausted_routes_count == 0
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ COMMON_RETRYABLE_REASONS = frozenset(
     {
         "rate_limited",
         "quota_exhausted",
+        "cooldown_active",
         "no_route",
         "provider_unavailable",
         "proxy_failed",

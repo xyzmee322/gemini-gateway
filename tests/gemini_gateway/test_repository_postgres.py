@@ -458,7 +458,9 @@ async def test_postgres_concurrent_lease_reserves_single_request_window(
     errors = [result for result in results if isinstance(result, GatewayError)]
     assert len(leases) == 1
     assert len(errors) == 1
-    assert errors[0].reason == "no_route"
+    assert errors[0].reason == "quota_exhausted"
+    assert errors[0].error_code == "quota_exhausted"
+    assert errors[0].quota_scope == "minute"
 
     async with session_factory() as session:
         no_route_attempt = (
@@ -491,15 +493,15 @@ async def test_postgres_concurrent_lease_reserves_single_request_window(
 
     assert dict(no_route_attempt) == {
         "status": "skipped_no_route",
-        "error_type": "no_route",
-        "error_message_safe": public_message_for_reason("no_route"),
+        "error_type": "quota_exhausted",
+        "error_message_safe": public_message_for_reason("quota_exhausted"),
         "retryable": True,
     }
     assert {row["window_kind"]: row["requests_used"] for row in rows} == {"day": 1, "minute": 1}
 
 
 @pytest.mark.asyncio
-async def test_postgres_no_route_reports_retry_after_when_day_quota_is_exhausted(
+async def test_postgres_reports_quota_exhausted_when_day_quota_is_exhausted(
     postgres_context: PostgresTestContext,
 ) -> None:
     repository = postgres_context.repository
@@ -511,7 +513,12 @@ async def test_postgres_no_route_reports_retry_after_when_day_quota_is_exhausted
     with pytest.raises(GatewayError) as exc_info:
         await repository.acquire_route(_request(suffix))
 
-    assert exc_info.value.reason == "no_route"
+    assert exc_info.value.reason == "quota_exhausted"
+    assert exc_info.value.error_code == "quota_exhausted"
+    assert exc_info.value.quota_scope == "day"
+    assert exc_info.value.quota_reset_at is not None
+    assert exc_info.value.eligible_routes_count == 1
+    assert exc_info.value.exhausted_routes_count == 1
     assert exc_info.value.retry_after_seconds is not None
     assert 0 < exc_info.value.retry_after_seconds <= 24 * 60 * 60
 
@@ -909,7 +916,9 @@ async def test_postgres_rate_limit_cooldown_is_model_scoped(
 
     with pytest.raises(GatewayError) as exc_info:
         await repository.acquire_route(_request(suffix, model=main_model))
-    assert exc_info.value.reason == "no_route"
+    assert exc_info.value.reason == "cooldown_active"
+    assert exc_info.value.error_code == "cooldown_active"
+    assert exc_info.value.sleep_until is not None
     assert exc_info.value.retry_after_seconds is not None
     assert exc_info.value.retry_after_seconds > 0
 
@@ -1002,7 +1011,9 @@ async def test_postgres_network_timeout_cooldown_is_model_scoped(
 
     with pytest.raises(GatewayError) as exc_info:
         await repository.acquire_route(_request(suffix, model=main_model))
-    assert exc_info.value.reason == "no_route"
+    assert exc_info.value.reason == "cooldown_active"
+    assert exc_info.value.error_code == "cooldown_active"
+    assert exc_info.value.sleep_until is not None
     assert exc_info.value.retry_after_seconds is not None
 
     gate_lease = await repository.acquire_route(_request(suffix, model=gate_model))

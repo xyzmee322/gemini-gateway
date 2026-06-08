@@ -160,10 +160,16 @@ class CompletionService:
                 "finish_reason": response.finish_reason,
                 "error_type": None,
                 "error_message": None,
+                "error_code": None,
                 "retryable": None,
                 "cooldown_scope": None,
                 "cooldown_level": None,
                 "sleep_until": None,
+                "quota_scope": None,
+                "quota_reset_at": None,
+                "eligible_routes_count": None,
+                "exhausted_routes_count": None,
+                "disabled_routes_count": None,
             }
         )
         _LOGGER.info("gemini_gateway_request", extra=event)
@@ -186,6 +192,7 @@ class CompletionService:
                 "reason": error.reason,
                 "failed_stage": _gateway_failure_stage(lease=lease, provider_called=provider_called),
                 "error_type": error.reason,
+                "error_code": getattr(error, "error_code", None),
                 "error_message": error.public_message,
                 "provider_reason": public_provider_reason(error.provider_message_safe),
                 "provider_status_code": error.provider_status_code,
@@ -194,6 +201,11 @@ class CompletionService:
                 "cooldown_scope": getattr(error, "cooldown_scope", None),
                 "cooldown_level": getattr(error, "cooldown_level", None),
                 "sleep_until": _serialize_datetime(getattr(error, "sleep_until", None)),
+                "quota_scope": getattr(error, "quota_scope", None),
+                "quota_reset_at": _serialize_datetime(getattr(error, "quota_reset_at", None)),
+                "eligible_routes_count": getattr(error, "eligible_routes_count", None),
+                "exhausted_routes_count": getattr(error, "exhausted_routes_count", None),
+                "disabled_routes_count": getattr(error, "disabled_routes_count", None),
             }
         )
         _LOGGER.warning("gemini_gateway_request", extra=event)

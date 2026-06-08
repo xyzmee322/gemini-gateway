@@ -78,6 +78,21 @@ class _RetryAfterFailingService:
         )
 
 
+class _QuotaExhaustedService:
+    async def complete(self, request: Any) -> GatewayChatResponse:
+        raise GatewayError(
+            reason="quota_exhausted",
+            retryable=True,
+            request_id=request.request_id,
+            retry_after_seconds=3600,
+            quota_scope="day",
+            quota_reset_at="2026-06-09T00:00:00Z",
+            eligible_routes_count=6,
+            exhausted_routes_count=6,
+            disabled_routes_count=4,
+        )
+
+
 class _BrokenService:
     async def complete(self, _: Any) -> GatewayChatResponse:
         raise RuntimeError("raw stack with AIza-secret")
@@ -332,6 +347,37 @@ def test_api_gateway_error_handler_includes_retry_after_hint() -> None:
     assert response.status_code == 429
     assert response.json()["reason"] == "no_route"
     assert response.json()["retry_after_seconds"] == 900
+
+
+def test_api_gateway_error_handler_returns_quota_exhausted_diagnostics() -> None:
+    app = create_app(auth_token="secret-token", completion_service=_QuotaExhaustedService())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-token"},
+        json={
+            "request_id": "req-quota",
+            "source_service": "test",
+            "model": "gemini-3.5-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "request_id": "req-quota",
+        "error": "Квота Gemini временно исчерпана, попробуй позже",
+        "reason": "quota_exhausted",
+        "error_code": "quota_exhausted",
+        "retryable": True,
+        "retry_after_seconds": 3600,
+        "quota_scope": "day",
+        "quota_reset_at": "2026-06-09T00:00:00Z",
+        "eligible_routes_count": 6,
+        "exhausted_routes_count": 6,
+        "disabled_routes_count": 4,
+    }
 
 
 def test_api_gateway_error_handler_includes_safe_provider_reason() -> None:

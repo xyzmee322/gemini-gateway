@@ -353,6 +353,7 @@ def _error_response(
     route_context: dict[str, str | None] | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> JSONResponse:
+    response_headers: dict[str, str] = {}
     content = {
         "request_id": request_id,
         "error": public_message or public_message_for_reason(reason),
@@ -365,6 +366,7 @@ def _error_response(
         content["provider_status_code"] = provider_status_code
     if retry_after_seconds is not None and retry_after_seconds > 0:
         content["retry_after_seconds"] = retry_after_seconds
+        response_headers["Retry-After"] = str(retry_after_seconds)
     if diagnostics:
         content.update({key: value for key, value in diagnostics.items() if value is not None})
     if route_context:
@@ -372,6 +374,7 @@ def _error_response(
     return JSONResponse(
         status_code=status_code,
         content=content,
+        headers=response_headers,
     )
 
 

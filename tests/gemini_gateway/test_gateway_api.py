@@ -345,6 +345,7 @@ def test_api_gateway_error_handler_includes_retry_after_hint() -> None:
     )
 
     assert response.status_code == 429
+    assert response.headers["Retry-After"] == "900"
     assert response.json()["reason"] == "no_route"
     assert response.json()["retry_after_seconds"] == 900
 
@@ -365,6 +366,7 @@ def test_api_gateway_error_handler_returns_quota_exhausted_diagnostics() -> None
     )
 
     assert response.status_code == 429
+    assert response.headers["Retry-After"] == "3600"
     assert response.json() == {
         "request_id": "req-quota",
         "error": "Квота Gemini временно исчерпана, попробуй позже",

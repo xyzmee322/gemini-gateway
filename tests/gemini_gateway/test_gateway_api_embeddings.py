@@ -31,6 +31,24 @@ class _SuccessfulEmbeddingService:
         )
 
 
+class _DirectFallbackEmbeddingService:
+    async def embed(self, request: Any) -> GatewayEmbeddingResponse:
+        return GatewayEmbeddingResponse(
+            request_id=request.request_id,
+            model=request.model,
+            embedding=[0.1, 0.2, 0.3],
+            dimensions=request.dimensions,
+            usage={"total_tokens": 3},
+            route={
+                "project_label": "openrouter-fallback",
+                "route_label": "openrouter-embedding-fallback",
+                "key_label": "openrouter-api-key",
+                "proxy_label": None,
+                "transport_mode": "direct",
+            },
+        )
+
+
 def test_embeddings_api_requires_bearer_token() -> None:
     app = create_app(auth_token="secret-token", completion_service=_SuccessfulEmbeddingService())
     client = TestClient(app)
@@ -86,13 +104,54 @@ def test_embeddings_api_returns_embedding_response() -> None:
     assert "raw_response" not in payload
 
 
+def test_embeddings_api_returns_direct_fallback_route_metadata() -> None:
+    app = create_app(auth_token="secret-token", completion_service=_DirectFallbackEmbeddingService())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/embeddings",
+        headers={"Authorization": "Bearer secret-token"},
+        json={
+            "request_id": "req-emb-direct",
+            "source_service": "media_memory",
+            "model": "google/gemini-embedding-2",
+            "input": [{"type": "text", "text": "кот"}],
+            "dimensions": 1536,
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["route"]["transport_mode"] == "direct"
+    assert payload["route"]["project_label"] == "openrouter-fallback"
+    assert payload["route"]["route_label"] == "openrouter-embedding-fallback"
+    assert payload["route"]["key_label"] == "openrouter-api-key"
+    assert "proxy_label" not in payload["route"]
+
+
 def test_gateway_main_wires_embedding_client_into_production_service() -> None:
     source = Path("gemini_gateway/main.py").read_text(encoding="utf-8")
     service_start = source.index("service = CompletionService(")
     service_end = source.index("    app = create_app(")
 
     assert "from gemini_gateway.embedding_client import GeminiEmbeddingClient" in source
+    assert "from gemini_gateway.openrouter_embedding_client import OpenRouterEmbeddingClient" in source
     assert "embedding_client = GeminiEmbeddingClient(" in source[:service_start]
     assert "base_url=_native_gemini_base_url(settings.upstream_base_url)" in source[:service_start]
     assert "client_pool=http_client_pool" in source[:service_start]
+    assert source.index("openrouter_embedding_client = OpenRouterEmbeddingClient(") < service_start
+    assert "base_url=settings.openrouter_base_url" in source[:service_start]
+    assert "timeout=settings.default_request_timeout_seconds" in source[:service_start]
+    assert source.index("openrouter_api_key = (") < service_start
+    assert "settings.openrouter_api_key.get_secret_value()" in source[:service_start]
+    assert "if settings.openrouter_api_key is not None" in source[:service_start]
+    assert "else None" in source[:service_start]
     assert "embedding_client=embedding_client" in source[service_start:service_end]
+    assert "openrouter_embedding_client=openrouter_embedding_client" in source[service_start:service_end]
+    assert "openrouter_api_key=openrouter_api_key" in source[service_start:service_end]
+    assert "openrouter_embeddings_fallback_enabled=settings.openrouter_embeddings_fallback_enabled" in source[
+        service_start:service_end
+    ]
+    assert "openrouter_embeddings_fallback_model=settings.openrouter_embeddings_fallback_model" in source[
+        service_start:service_end
+    ]

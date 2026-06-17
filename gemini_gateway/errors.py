@@ -14,7 +14,7 @@ _PUBLIC_MESSAGES: dict[GatewayErrorReason, str] = {
     "no_route": "Сейчас нет доступного маршрута для Gemini, попробуй позже",
     "cooldown_active": "Маршруты Gemini временно охлаждаются, попробуй позже",
     "rate_limited": COMMON_PUBLIC_MESSAGES["rate_limited"],
-    "quota_exhausted": "Квота Gemini временно исчерпана, попробуй позже",
+    "quota_exhausted": "Квота AI-провайдера временно исчерпана, попробуй позже",
     "auth_failed": COMMON_PUBLIC_MESSAGES["auth_failed"],
     "proxy_failed": COMMON_PUBLIC_MESSAGES["provider_unavailable"],
     "network_timeout": COMMON_PUBLIC_MESSAGES["network_timeout"],

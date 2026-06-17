@@ -3,7 +3,7 @@
 import asyncio
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import Any, Protocol
@@ -40,6 +40,7 @@ _PROJECT_MODEL_COOLDOWN_REASONS = frozenset({"rate_limited", "quota_exhausted"})
 _MODEL_SCOPED_COOLDOWN_REASONS = _PROJECT_MODEL_COOLDOWN_REASONS
 _TRANSPORT_COOLDOWN_REASONS = frozenset({"proxy_failed", "network_timeout"})
 _MODEL_SCOPED_TRANSPORT_COOLDOWN_REASONS = frozenset({"network_timeout"})
+ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE = "attempted_routes_exhausted"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class _RouteAcquisitionDiagnostics:
     """Сводка причины, почему маршрут сейчас нельзя выдать."""
 
     reason: str
+    error_code: str | None = None
     retry_after_seconds: int | None = None
     quota_scope: str | None = None
     quota_reset_at: datetime | None = None
@@ -211,11 +213,20 @@ class InMemoryRouteRepository:
 
         async with self._lock:
             attempted_bindings = self._attempted_bindings_by_request.setdefault(_request_group_id(request), set())
-            model_routes = [
+            initial_model_routes = [
                 route
                 for route in self._routes.values()
-                if route.model == request.model and route.binding_id not in attempted_bindings
+                if route.model == request.model
             ]
+            model_routes = [
+                route
+                for route in initial_model_routes
+                if route.binding_id not in attempted_bindings
+            ]
+            prior_model_route_attempted = any(
+                route.binding_id in attempted_bindings
+                for route in initial_model_routes
+            )
             candidates = [
                 route
                 for route in model_routes
@@ -232,6 +243,11 @@ class InMemoryRouteRepository:
                     estimated_tokens=estimated_tokens,
                     now=now,
                 )
+                if prior_model_route_attempted:
+                    diagnostics = _with_route_acquisition_error_code(
+                        diagnostics,
+                        ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
+                    )
                 raise _route_acquisition_error(request=request, diagnostics=diagnostics)
 
             route.minute_requests_used += 1
@@ -351,7 +367,8 @@ class PostgresGatewayRepository:
         now = datetime.now(tz=UTC)
         candidates = await self.list_route_candidates(request.model, now)
         attempted_binding_ids = await self._attempted_binding_ids(request=request)
-        skipped_by_attempt = False
+        prior_model_route_attempted = bool(attempted_binding_ids)
+        attempted_routes_excluded = False
         if attempted_binding_ids:
             initial_count = len(candidates)
             candidates = [
@@ -359,7 +376,7 @@ class PostgresGatewayRepository:
                 for candidate in candidates
                 if str(candidate.binding_id) not in attempted_binding_ids
             ]
-            skipped_by_attempt = initial_count > 0 and not candidates
+            attempted_routes_excluded = initial_count > len(candidates)
 
         while candidates:
             candidate = RouteScorer.choose(candidates, estimated_tokens, now)
@@ -375,7 +392,7 @@ class PostgresGatewayRepository:
                 return lease
             candidates = [item for item in candidates if item.binding_id != candidate.binding_id]
 
-        if skipped_by_attempt:
+        if attempted_routes_excluded and not candidates:
             diagnostics = _RouteAcquisitionDiagnostics(reason="no_route")
         elif candidates:
             diagnostics = _route_unavailability_from_candidates(
@@ -389,6 +406,11 @@ class PostgresGatewayRepository:
                 model=request.model,
                 estimated_tokens=estimated_tokens,
                 now=now,
+            )
+        if prior_model_route_attempted:
+            diagnostics = _with_route_acquisition_error_code(
+                diagnostics,
+                ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
             )
         await self._record_skipped_route_unavailable(
             request=request,
@@ -2272,7 +2294,8 @@ def _route_acquisition_error(
         request_id=request.request_id,
         retryable=True,
         retry_after_seconds=diagnostics.retry_after_seconds,
-        error_code=diagnostics.reason if diagnostics.reason in {"quota_exhausted", "cooldown_active"} else None,
+        error_code=diagnostics.error_code
+        or (diagnostics.reason if diagnostics.reason in {"quota_exhausted", "cooldown_active"} else None),
         quota_scope=diagnostics.quota_scope,
         quota_reset_at=diagnostics.quota_reset_at,
         eligible_routes_count=diagnostics.eligible_routes_count,
@@ -2281,6 +2304,13 @@ def _route_acquisition_error(
         cooldown_level=diagnostics.cooldown_level,
         sleep_until=diagnostics.sleep_until,
     )
+
+
+def _with_route_acquisition_error_code(
+    diagnostics: _RouteAcquisitionDiagnostics,
+    error_code: str,
+) -> _RouteAcquisitionDiagnostics:
+    return replace(diagnostics, error_code=error_code)
 
 
 def _candidate_request_is_permanently_too_large(*, candidate: RouteCandidate, estimated_tokens: int) -> bool:

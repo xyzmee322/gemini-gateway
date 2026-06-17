@@ -9,3 +9,6 @@ logs/*.log
 logs/raw/*.json
 gemini-gateway-seed.yaml
 debug/
+.agnt/
+AGENTS.md
+CLAUDE.md

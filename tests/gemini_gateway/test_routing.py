@@ -11,15 +11,25 @@ import pytest
 from gemini_gateway.contracts import (
     GatewayChatRequest,
     GatewayChatResponse,
+    GatewayEmbeddingRequest,
+    GatewayEmbeddingResponse,
     GatewayTTSRequest,
     GatewayTTSResponse,
     RouteCandidate,
+    RouteLease,
 )
 from gemini_gateway.errors import GatewayError
 from gemini_gateway.gemini_client import GeminiOpenAIClient
-from gemini_gateway.repository import InMemoryRouteRepository, RouteScorer
+from gemini_gateway.repository import (
+    ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
+    InMemoryRouteRepository,
+    RouteScorer,
+)
 from gemini_gateway.repository import _safe_provider_response_json
 from gemini_gateway.service import CompletionService
+
+_OPENROUTER_EMBEDDING_MODEL = "google/gemini-embedding-2"
+_OPENROUTER_API_KEY = "sk-or-test-openrouter-secret"
 
 
 def _candidate(
@@ -55,6 +65,132 @@ def _candidate(
         day_tokens_reserved=day_tokens_reserved,
         half_open=half_open,
     )
+
+
+def _embedding_request(
+    *,
+    request_id: str = "req-openrouter-fallback",
+    model: str = _OPENROUTER_EMBEDDING_MODEL,
+) -> GatewayEmbeddingRequest:
+    return GatewayEmbeddingRequest(
+        request_id=request_id,
+        source_service="media_memory",
+        model=model,
+        input=[{"type": "text", "text": "кот на диване"}],
+        dimensions=1536,
+        chat_id=42,
+    )
+
+
+class _RouteFailureRepository:
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+        self.failures: list[dict[str, Any]] = []
+        self.successes: list[dict[str, Any]] = []
+
+    async def acquire_route(self, request: GatewayEmbeddingRequest) -> None:
+        raise GatewayError(reason=self._reason, retryable=True, request_id=request.request_id)
+
+    async def record_success(self, lease: Any, response: Any, latency_ms: int) -> None:
+        self.successes.append({"lease": lease, "response": response, "latency_ms": latency_ms})
+
+    async def record_failure(
+        self,
+        lease: Any,
+        error: GatewayError,
+        latency_ms: int,
+        provider_called: bool,
+    ) -> None:
+        self.failures.append(
+            {
+                "lease": lease,
+                "error": error,
+                "latency_ms": latency_ms,
+                "provider_called": provider_called,
+            }
+        )
+
+
+class _RecordingGeminiEmbeddingClient:
+    def __init__(self) -> None:
+        self.called = False
+
+    async def embed(
+        self,
+        request: GatewayEmbeddingRequest,
+        api_key: str,
+        proxy_url: str,
+    ) -> GatewayEmbeddingResponse:
+        self.called = True
+        return GatewayEmbeddingResponse(
+            request_id=request.request_id,
+            model=request.model,
+            embedding=[0.1] * request.dimensions,
+            dimensions=request.dimensions,
+            usage={"total_tokens": 5},
+        )
+
+
+class _RecordingOpenRouterEmbeddingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def embed(
+        self,
+        *,
+        request: GatewayEmbeddingRequest,
+        api_key: str,
+    ) -> GatewayEmbeddingResponse:
+        self.calls.append({"request": request, "api_key": api_key})
+        return GatewayEmbeddingResponse(
+            request_id=request.request_id,
+            generation_id="gen-openrouter-fallback",
+            model=request.model,
+            embedding=[0.2] * request.dimensions,
+            dimensions=request.dimensions,
+            usage={"prompt_tokens": 3, "total_tokens": 3},
+        )
+
+
+class _AcquireRecordingRepository:
+    def __init__(self) -> None:
+        self.acquire_called = False
+        self.failures: list[dict[str, Any]] = []
+
+    async def acquire_route(self, request: GatewayEmbeddingRequest) -> RouteLease:
+        self.acquire_called = True
+        return RouteLease(
+            attempt_id="attempt-preflight",
+            binding_id="binding-preflight",
+            project_id="project-preflight",
+            api_key_id="key-preflight",
+            proxy_id="proxy-preflight",
+            api_key="AIza-preflight",
+            proxy_url="http://127.0.0.1:9000",
+            model=request.model,
+            route_label="route-preflight",
+            project_label="project-preflight",
+            key_label="key-preflight",
+            proxy_label="proxy-preflight",
+            estimated_tokens=10,
+            leased_at=datetime.now(tz=UTC),
+        )
+
+    async def record_failure(
+        self,
+        lease: RouteLease | None,
+        error: GatewayError,
+        latency_ms: int,
+        provider_called: bool,
+    ) -> None:
+        self.failures.append(
+            {
+                "lease": lease,
+                "error": error,
+                "latency_ms": latency_ms,
+                "provider_called": provider_called,
+            }
+        )
 
 
 def test_route_scorer_skips_cooldowns_and_insufficient_token_budget() -> None:
@@ -207,6 +343,7 @@ async def test_repository_does_not_reuse_route_inside_same_soybob_request() -> N
 
     assert [lease.binding_id for lease in leases] == ["a", "b", "c"]
     assert exc_info.value.reason == "no_route"
+    assert exc_info.value.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
 
 
 @pytest.mark.asyncio
@@ -674,3 +811,319 @@ async def test_completion_service_cools_down_route_when_proxy_fails() -> None:
 
     [route] = await repository.list_route_candidates("gemini-3.5-flash", datetime.now(tz=UTC))
     assert route.cooldown_until is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_failure_reason", ["quota_exhausted", "cooldown_active", "no_route"])
+async def test_completion_service_uses_openrouter_embedding_fallback_for_route_acquisition_failures(
+    route_failure_reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = _RouteFailureRepository(route_failure_reason)
+    gemini_client = _RecordingGeminiEmbeddingClient()
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=gemini_client,
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+    request = _embedding_request(request_id=f"req-fallback-{route_failure_reason}")
+    caplog.set_level(logging.INFO, logger="gemini_gateway.service")
+
+    response = await service.embed(request)
+
+    assert gemini_client.called is False
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert len(repository.failures) == 1
+    assert repository.failures[0]["lease"] is None
+    assert repository.failures[0]["provider_called"] is False
+    assert repository.failures[0]["error"].reason == route_failure_reason
+    assert response.route.proxy_label is None
+    assert response.route["proxy_label"] is None
+    assert response.route.model_dump(mode="json", exclude_none=True) == {
+        "project_label": "openrouter-fallback",
+        "route_label": "openrouter-embedding-fallback",
+        "key_label": "openrouter-api-key",
+        "transport_mode": "direct",
+    }
+    assert response.model_dump(mode="json", exclude_none=True)["route"] == {
+        "project_label": "openrouter-fallback",
+        "route_label": "openrouter-embedding-fallback",
+        "key_label": "openrouter-api-key",
+        "transport_mode": "direct",
+    }
+    assert response.project_label == "openrouter-fallback"
+    assert response.route_label == "openrouter-embedding-fallback"
+    assert response.key_label == "openrouter-api-key"
+    assert response.proxy_label is None
+    assert response.transport_mode == "direct"
+
+    route_acquisition_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "gemini_gateway_request"
+        and getattr(record, "status", None) == "error"
+        and getattr(record, "fallback_provider", None) is None
+    ]
+    assert len(route_acquisition_records) == 1
+    route_acquisition_record = route_acquisition_records[0]
+    assert route_acquisition_record.reason == route_failure_reason
+    assert route_acquisition_record.failed_stage == "route_acquisition"
+    assert route_acquisition_record.route_label is None
+    assert route_acquisition_record.transport_mode is None
+
+    fallback_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "gemini_gateway_request"
+        and getattr(record, "fallback_provider", None) == "openrouter"
+    ]
+    assert len(fallback_records) == 1
+    fallback_record = fallback_records[0]
+    assert fallback_record.status == "success"
+    assert fallback_record.project_label == "openrouter-fallback"
+    assert fallback_record.route_label == "openrouter-embedding-fallback"
+    assert fallback_record.key_label == "openrouter-api-key"
+    assert fallback_record.proxy_label is None
+    assert fallback_record.transport_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_acquire_route_or_fallback_without_gemini_embedding_client() -> None:
+    repository = _AcquireRecordingRepository()
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=None,
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.embed(_embedding_request(request_id="req-no-gemini-embedding-client"))
+
+    assert exc_info.value.reason == "provider_unavailable"
+    assert repository.acquire_called is False
+    assert repository.failures == []
+    assert openrouter_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_enabled", "openrouter_api_key", "openrouter_client"),
+    [
+        (False, _OPENROUTER_API_KEY, _RecordingOpenRouterEmbeddingClient()),
+        (True, "   ", _RecordingOpenRouterEmbeddingClient()),
+        (True, _OPENROUTER_API_KEY, None),
+    ],
+)
+async def test_completion_service_does_not_use_openrouter_embedding_fallback_when_not_configured(
+    fallback_enabled: bool,
+    openrouter_api_key: str,
+    openrouter_client: _RecordingOpenRouterEmbeddingClient | None,
+) -> None:
+    repository = _RouteFailureRepository("no_route")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_RecordingGeminiEmbeddingClient(),
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_embeddings_fallback_enabled=fallback_enabled,
+        environment="test",
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.embed(_embedding_request(request_id="req-openrouter-not-configured"))
+
+    assert exc_info.value.reason == "no_route"
+    if openrouter_client is not None:
+        assert openrouter_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_use_openrouter_embedding_fallback_for_other_models() -> None:
+    repository = _RouteFailureRepository("no_route")
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_RecordingGeminiEmbeddingClient(),
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.embed(_embedding_request(request_id="req-other-embedding-model", model="text-embedding-004"))
+
+    assert exc_info.value.reason == "no_route"
+    assert openrouter_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_use_openrouter_embedding_fallback_after_leased_route_failure() -> None:
+    class _FailingGeminiEmbeddingClient:
+        async def embed(
+            self,
+            request: GatewayEmbeddingRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayEmbeddingResponse:
+            raise GatewayError(
+                reason="quota_exhausted",
+                retryable=True,
+                request_id=request.request_id,
+                provider_status_code=429,
+                provider_message_safe=f"quota exhausted for {api_key} via {proxy_url}",
+            )
+
+    route = _candidate(
+        "emb-leased",
+        api_key="AIza-emb-secret",
+        proxy_url="http://user:pass@127.0.0.1:9000",
+    )
+    route.model = _OPENROUTER_EMBEDDING_MODEL
+    repository = InMemoryRouteRepository([route])
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_FailingGeminiEmbeddingClient(),
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.embed(_embedding_request(request_id="req-leased-gemini-failure"))
+
+    error = exc_info.value
+    assert error.reason == "quota_exhausted"
+    assert error.route_label == "route-emb-leased"
+    assert error.project_label == "friend-emb-leased"
+    assert error.key_label == "key-emb-leased"
+    assert error.proxy_label == "proxy-emb-leased"
+    assert error.transport_mode == "proxy"
+    assert openrouter_client.calls == []
+    assert repository.failures[-1]["provider_called"] is True
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_use_openrouter_embedding_fallback_after_request_group_routes_exhausted() -> None:
+    class _FailingGeminiEmbeddingClient:
+        async def embed(
+            self,
+            request: GatewayEmbeddingRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayEmbeddingResponse:
+            del api_key, proxy_url
+            raise GatewayError(
+                reason="proxy_failed",
+                retryable=True,
+                request_id=request.request_id,
+                provider_called=False,
+            )
+
+    route = _candidate("emb-request-group")
+    route.model = _OPENROUTER_EMBEDDING_MODEL
+    repository = InMemoryRouteRepository([route])
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_FailingGeminiEmbeddingClient(),
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    first_request = _embedding_request(request_id="req-group-first")
+    first_request.soybob_request_id = "embedding-request-group"
+    second_request = _embedding_request(request_id="req-group-second")
+    second_request.soybob_request_id = "embedding-request-group"
+    second_request.retry_count = 1
+
+    with pytest.raises(GatewayError) as first_exc_info:
+        await service.embed(first_request)
+
+    assert first_exc_info.value.reason == "proxy_failed"
+    assert first_exc_info.value.route_label == "route-emb-request-group"
+
+    with pytest.raises(GatewayError) as second_exc_info:
+        await service.embed(second_request)
+
+    assert second_exc_info.value.reason == "no_route"
+    assert second_exc_info.value.error_code == "attempted_routes_exhausted"
+    assert second_exc_info.value.route_label is None
+    assert openrouter_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_completion_service_attaches_direct_metadata_when_openrouter_embedding_fallback_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _FailingOpenRouterEmbeddingClient:
+        async def embed(
+            self,
+            *,
+            request: GatewayEmbeddingRequest,
+            api_key: str,
+        ) -> GatewayEmbeddingResponse:
+            del api_key
+            raise GatewayError(
+                reason="provider_unavailable",
+                retryable=True,
+                request_id=request.request_id,
+                provider_called=True,
+            )
+
+    repository = _RouteFailureRepository("no_route")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_RecordingGeminiEmbeddingClient(),
+        openrouter_embedding_client=_FailingOpenRouterEmbeddingClient(),
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+    caplog.set_level(logging.INFO, logger="gemini_gateway.service")
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.embed(_embedding_request(request_id="req-openrouter-fallback-fails"))
+
+    error = exc_info.value
+    assert error.reason == "provider_unavailable"
+    assert error.project_label == "openrouter-fallback"
+    assert error.route_label == "openrouter-embedding-fallback"
+    assert error.key_label == "openrouter-api-key"
+    assert error.proxy_label is None
+    assert error.transport_mode == "direct"
+
+    fallback_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "gemini_gateway_request"
+        and getattr(record, "fallback_provider", None) == "openrouter"
+    ]
+    assert len(fallback_records) == 1
+    fallback_record = fallback_records[0]
+    assert fallback_record.status == "error"
+    assert fallback_record.failed_stage == "openrouter_embedding_fallback"
+    assert fallback_record.project_label == "openrouter-fallback"
+    assert fallback_record.route_label == "openrouter-embedding-fallback"
+    assert fallback_record.key_label == "openrouter-api-key"
+    assert fallback_record.proxy_label is None
+    assert fallback_record.transport_mode == "direct"

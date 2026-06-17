@@ -369,7 +369,7 @@ def test_api_gateway_error_handler_returns_quota_exhausted_diagnostics() -> None
     assert response.headers["Retry-After"] == "3600"
     assert response.json() == {
         "request_id": "req-quota",
-        "error": "Квота Gemini временно исчерпана, попробуй позже",
+        "error": "Квота AI-провайдера временно исчерпана, попробуй позже",
         "reason": "quota_exhausted",
         "error_code": "quota_exhausted",
         "retryable": True,

@@ -24,7 +24,15 @@ GatewayErrorReason = Literal[
     "unauthorized",
     "bad_request",
 ]
-TransportMode = Literal["proxy"]
+GatewayTransportMode = Literal["proxy", "direct"]
+GeminiRouteTransportMode = Literal["proxy"]
+TransportMode = GatewayTransportMode
+
+
+def _reject_direct_transport_mode(value: Any, *, message: str) -> Any:
+    if isinstance(value, str) and value.strip().lower() == "direct":
+        raise ValueError(message)
+    return value
 
 
 def sanitize_gateway_provider_specific_fields(payload: Any) -> dict[str, Any]:
@@ -39,6 +47,18 @@ def sanitize_gateway_choices(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [allowlist_provider_metadata_tree(choice) for choice in value if isinstance(choice, dict)]
+
+
+def normalize_gateway_route_metadata(value: Any) -> Any:
+    """Валидирует непустые route metadata, сохраняя пустой legacy dict."""
+
+    if isinstance(value, GatewayRouteMetadata):
+        return value
+    if isinstance(value, dict):
+        if not value:
+            return {}
+        return GatewayRouteMetadata.model_validate(value)
+    return value
 
 
 class GatewayRouteRequest(BaseModel):
@@ -154,6 +174,11 @@ class GatewayTTSResponse(BaseModel):
     def sanitize_provider_specific_fields(cls, value: Any) -> dict[str, Any]:
         return sanitize_gateway_provider_specific_fields(value)
 
+    @field_validator("route", mode="before")
+    @classmethod
+    def normalize_route_metadata(cls, value: Any) -> Any:
+        return normalize_gateway_route_metadata(value)
+
 
 class GatewayRouteMetadata(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -161,8 +186,14 @@ class GatewayRouteMetadata(BaseModel):
     route_label: str
     project_label: str
     key_label: str
-    proxy_label: str = Field(min_length=1)
-    transport_mode: TransportMode = "proxy"
+    proxy_label: str | None = Field(default=None, min_length=1)
+    transport_mode: GatewayTransportMode = "proxy"
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self.__class__.model_fields:
+            return getattr(self, key)
+        extra = self.model_extra or {}
+        return extra[key]
 
 
 class GatewayChatResponse(BaseModel):
@@ -189,6 +220,11 @@ class GatewayChatResponse(BaseModel):
     @classmethod
     def sanitize_provider_specific_fields(cls, value: Any) -> dict[str, Any]:
         return sanitize_gateway_provider_specific_fields(value)
+
+    @field_validator("route", mode="before")
+    @classmethod
+    def normalize_route_metadata(cls, value: Any) -> Any:
+        return normalize_gateway_route_metadata(value)
 
     @model_validator(mode="after")
     def fill_finish_reason_from_choices(self) -> "GatewayChatResponse":
@@ -225,6 +261,11 @@ class GatewayEmbeddingResponse(BaseModel):
     def sanitize_provider_specific_fields(cls, value: Any) -> dict[str, Any]:
         return sanitize_gateway_provider_specific_fields(value)
 
+    @field_validator("route", mode="before")
+    @classmethod
+    def normalize_route_metadata(cls, value: Any) -> Any:
+        return normalize_gateway_route_metadata(value)
+
 
 GatewayProviderResponse = GatewayChatResponse | GatewayTTSResponse | GatewayEmbeddingResponse
 
@@ -250,7 +291,7 @@ class GatewayErrorResponse(BaseModel):
     project_label: str | None = None
     key_label: str | None = None
     proxy_label: str | None = None
-    transport_mode: TransportMode | None = None
+    transport_mode: GatewayTransportMode | None = None
 
 
 class RouteCandidate(BaseModel):
@@ -269,7 +310,7 @@ class RouteCandidate(BaseModel):
     project_label: str
     key_label: str
     proxy_label: str | None = None
-    transport_mode: TransportMode = "proxy"
+    transport_mode: GeminiRouteTransportMode = "proxy"
     requests_per_minute: int
     tokens_per_minute: int
     requests_per_day: int
@@ -282,6 +323,14 @@ class RouteCandidate(BaseModel):
     half_open: bool = False
     priority: int = 100
     last_used_at: datetime | None = None
+
+    @field_validator("transport_mode", mode="before")
+    @classmethod
+    def reject_direct_transport_mode(cls, value: Any) -> Any:
+        return _reject_direct_transport_mode(
+            value,
+            message="direct transport is disabled for Gemini routes; use a proxy route",
+        )
 
 
 class RouteLease(BaseModel):
@@ -301,9 +350,17 @@ class RouteLease(BaseModel):
     project_label: str
     key_label: str
     proxy_label: str = Field(min_length=1)
-    transport_mode: TransportMode = "proxy"
+    transport_mode: GeminiRouteTransportMode = "proxy"
     estimated_tokens: int
     leased_at: datetime
+
+    @field_validator("transport_mode", mode="before")
+    @classmethod
+    def reject_direct_transport_mode(cls, value: Any) -> Any:
+        return _reject_direct_transport_mode(
+            value,
+            message="direct transport is disabled for Gemini routes; use a proxy route",
+        )
 
 
 class SeedModelLimit(BaseModel):
@@ -367,14 +424,15 @@ class SeedBinding(BaseModel):
     project_label: str | None = Field(default=None, min_length=1, max_length=80)
     api_key_label: str = Field(min_length=1, max_length=80)
     proxy_label: str | None = Field(default=None, min_length=1, max_length=80)
-    transport_mode: TransportMode = "proxy"
+    transport_mode: GeminiRouteTransportMode = "proxy"
 
     @field_validator("transport_mode", mode="before")
     @classmethod
     def reject_direct_transport_mode(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.strip().lower() == "direct":
-            raise ValueError("direct bindings are disabled; use a proxy binding")
-        return value
+        return _reject_direct_transport_mode(
+            value,
+            message="direct bindings are disabled; use a proxy binding",
+        )
 
 
 class SeedConfig(BaseModel):

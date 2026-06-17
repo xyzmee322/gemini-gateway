@@ -24,7 +24,11 @@ from gemini_gateway.contracts import (
     SeedProxy,
 )
 from gemini_gateway.errors import GatewayError, public_message_for_reason
-from gemini_gateway.repository import PostgresGatewayRepository, PostgresGatewaySeedRepository
+from gemini_gateway.repository import (
+    ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
+    PostgresGatewayRepository,
+    PostgresGatewaySeedRepository,
+)
 from gemini_gateway.security import SecretVault
 from tests.db_test_policy import default_test_postgres_dsn, skip_or_fail_db_unavailable
 
@@ -410,6 +414,7 @@ async def test_postgres_acquire_route_does_not_reuse_binding_inside_soybob_reque
 
     assert second_lease.binding_id != first_lease.binding_id
     assert exc_info.value.reason == "no_route"
+    assert exc_info.value.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
 
 
 @pytest.mark.asyncio
@@ -1049,6 +1054,42 @@ async def test_postgres_network_timeout_cooldown_is_model_scoped(
         )
 
     assert active_main_cooldowns == 2
+
+
+@pytest.mark.asyncio
+async def test_postgres_attempted_route_marker_survives_hidden_cooldown_candidate(
+    postgres_context: PostgresTestContext,
+) -> None:
+    repository = postgres_context.repository
+    suffix = postgres_context.suffix
+    group_id = f"pg-hidden-cooldown-group-{suffix}"
+    model = f"google/gemini-postgres-hidden-cooldown-{suffix}"
+    await postgres_context.seed_repository.upsert_seed_config(_pool_seed_config(suffix, route_count=1, model=model))
+
+    first_request = _request(suffix, model=model)
+    first_request.soybob_request_id = group_id
+    first_lease = await repository.acquire_route(first_request)
+    await repository.record_failure(
+        first_lease,
+        GatewayError(
+            reason="network_timeout",
+            retryable=True,
+            provider_message_safe="read_timeout",
+            request_id=first_request.request_id,
+        ),
+        latency_ms=30_000,
+        provider_called=True,
+    )
+
+    retry_request = _request(suffix, model=model)
+    retry_request.soybob_request_id = group_id
+    retry_request.retry_count = 1
+
+    with pytest.raises(GatewayError) as exc_info:
+        await repository.acquire_route(retry_request)
+
+    assert exc_info.value.reason == "cooldown_active"
+    assert exc_info.value.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from gemini_gateway.db.session import create_gateway_engine
 from gemini_gateway.embedding_client import GeminiEmbeddingClient
 from gemini_gateway.gemini_client import GeminiOpenAIClient
 from gemini_gateway.http_client_pool import GatewayHttpClientPool
+from gemini_gateway.openrouter_embedding_client import OpenRouterEmbeddingClient
 from gemini_gateway.repository import PostgresGatewayRepository
 from gemini_gateway.retention import GatewayRetentionService
 from gemini_gateway.security import SecretVault
@@ -48,11 +49,24 @@ def build_app():
         timeout=settings.default_request_timeout_seconds,
         client_pool=http_client_pool,
     )
+    openrouter_embedding_client = OpenRouterEmbeddingClient(
+        base_url=settings.openrouter_base_url,
+        timeout=settings.default_request_timeout_seconds,
+    )
+    openrouter_api_key = (
+        settings.openrouter_api_key.get_secret_value()
+        if settings.openrouter_api_key is not None
+        else None
+    )
     service = CompletionService(
         repository=repository,
         gemini_client=gemini_client,
         tts_client=tts_client,
         embedding_client=embedding_client,
+        openrouter_embedding_client=openrouter_embedding_client,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_embeddings_fallback_enabled=settings.openrouter_embeddings_fallback_enabled,
+        openrouter_embeddings_fallback_model=settings.openrouter_embeddings_fallback_model,
         service_name=settings.service_name,
         environment=settings.environment,
     )

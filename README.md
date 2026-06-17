@@ -15,14 +15,35 @@
 ## Локальный запуск
 
 ```powershell
-docker compose up -d postgres migrations gateway
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres migrations gateway
 ```
 
 Seed маршрутов запускается отдельно, когда заданы `GEMINI_API_KEY` и `GEMINI_GATEWAY_PROXY_URL`:
 
 ```powershell
-docker compose --profile seed run --rm seed
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile seed run --rm seed
 ```
+
+## OpenRouter fallback для embeddings
+
+Gateway может использовать OpenRouter без proxy только как fallback для `POST /v1/embeddings` и только для модели `google/gemini-embedding-2`.
+
+Fallback выключен по умолчанию, чтобы случайно не включить платный путь. Для включения:
+
+```powershell
+$env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED="true"
+$env:GEMINI_GATEWAY_OPENROUTER_API_KEY="sk-or-..."
+```
+
+Условия срабатывания:
+
+- сначала gateway пытается выдать обычный Gemini route `api_key + proxy`;
+- OpenRouter вызывается только если route pool не может выдать ни одного Gemini route для `google/gemini-embedding-2`;
+- разрешённые причины: `no_route`, `cooldown_active`, `quota_exhausted`;
+- fallback не срабатывает после ошибки одного уже выбранного Gemini route, потому что это не доказывает недоступность всех ключей;
+- chat completions и TTS никогда не используют OpenRouter fallback.
+
+В ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-fallback`, `route_label: openrouter-embedding-fallback`.
 
 ## Перенос данных из Soybob V3
 
@@ -44,3 +65,7 @@ docker compose up -d postgres migrations
 ```powershell
 python -m pytest tests/gemini_gateway -q
 ```
+
+## Операции
+
+- [Zombie process monitoring](docs/operations/zombie-processes.md): проверка `[python] <defunct>`, `init: true` и post-deploy чеклист.

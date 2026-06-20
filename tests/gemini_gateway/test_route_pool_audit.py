@@ -566,6 +566,58 @@ def test_summarize_recent_attempt_rows_counts_safe_provider_reasons() -> None:
     }
 
 
+def test_summarize_recent_attempt_rows_reports_route_latency_without_raw_payload() -> None:
+    report = summarize_recent_attempt_rows(
+        window_minutes=30,
+        rows=[
+            {
+                "status": "failed",
+                "error_type": "network_timeout",
+                "route_label": "Keyproxy4",
+                "retry_count": 0,
+                "count": 3,
+                "latency_count": 2,
+                "avg_latency_ms": 25000,
+                "max_latency_ms": 25200,
+            },
+            {
+                "status": "success",
+                "error_type": None,
+                "route_label": "Keyproxy4",
+                "retry_count": 1,
+                "count": 1,
+                "latency_count": 1,
+                "avg_latency_ms": 1500,
+                "max_latency_ms": 1500,
+            },
+            {
+                "status": "success",
+                "error_type": None,
+                "route_label": "local-dev-route",
+                "retry_count": 0,
+                "count": 3,
+                "latency_count": 3,
+                "avg_latency_ms": 1200,
+                "max_latency_ms": 1400,
+            },
+        ],
+    )
+
+    assert report["route_attempt_counts"]["Keyproxy4"]["latency_ms"] == {
+        "avg": 17167,
+        "max": 25200,
+        "status_avg": {
+            "failed": 25000,
+            "success": 1500,
+        },
+    }
+    assert report["route_attempt_counts"]["local-dev-route"]["latency_ms"] == {
+        "avg": 1200,
+        "max": 1400,
+        "status_avg": {"success": 1200},
+    }
+
+
 def test_summarize_recent_request_group_rows_reports_retry_outcomes() -> None:
     report = summarize_recent_request_group_rows(
         window_minutes=120,

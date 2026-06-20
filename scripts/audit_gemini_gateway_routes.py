@@ -381,7 +381,10 @@ async def fetch_recent_attempt_rows(
             route_label,
             retry_count,
             provider_response_json->>'provider_reason' AS provider_reason,
-            COUNT(*) AS count
+            COUNT(*) AS count,
+            COUNT(latency_ms) AS latency_count,
+            ROUND(AVG(latency_ms))::integer AS avg_latency_ms,
+            MAX(latency_ms) AS max_latency_ms
         FROM gemini_gateway.route_attempts
         WHERE model = :model
           AND created_at >= CAST(:now AS timestamptz) - (CAST(:window_minutes AS integer) * interval '1 minute')
@@ -833,9 +836,77 @@ def _route_attempt_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[s
             "error_type_counts": _counts_by_field(route_rows, "error_type"),
             "retry_count_counts": _counts_by_field(route_rows, "retry_count"),
             "provider_reason_counts": _provider_reason_counts(route_rows),
+            **_optional_latency_summary_field(route_rows),
         }
         for route_label, route_rows in sorted(rows_by_route.items())
     }
+
+
+def _optional_latency_summary_field(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    latency_summary = _latency_summary(rows)
+    if latency_summary is None:
+        return {}
+    return {"latency_ms": latency_summary}
+
+
+def _latency_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    normalized_rows = list(rows)
+    weighted_total = 0
+    weighted_count = 0
+    max_latency: int | None = None
+    rows_by_status: dict[str, list[Mapping[str, Any]]] = {}
+    for row in normalized_rows:
+        avg_latency = _optional_int(row.get("avg_latency_ms"))
+        row_count = _latency_count_value(row)
+        if avg_latency is not None and row_count > 0:
+            weighted_total += avg_latency * row_count
+            weighted_count += row_count
+            status = _optional_str(row.get("status"))
+            if status is not None:
+                rows_by_status.setdefault(status, []).append(row)
+        row_max_latency = _optional_int(row.get("max_latency_ms"))
+        if row_max_latency is not None:
+            max_latency = row_max_latency if max_latency is None else max(max_latency, row_max_latency)
+
+    if weighted_count <= 0 and max_latency is None:
+        return None
+
+    summary: dict[str, Any] = {}
+    if weighted_count > 0:
+        summary["avg"] = round(weighted_total / weighted_count)
+    if max_latency is not None:
+        summary["max"] = max_latency
+
+    status_avg: dict[str, int] = {}
+    for status, status_rows in sorted(rows_by_status.items()):
+        average_latency = _weighted_avg_latency(status_rows)
+        if average_latency is not None:
+            status_avg[status] = average_latency
+    if status_avg:
+        summary["status_avg"] = status_avg
+    return summary
+
+
+def _weighted_avg_latency(rows: Iterable[Mapping[str, Any]]) -> int | None:
+    weighted_total = 0
+    weighted_count = 0
+    for row in rows:
+        avg_latency = _optional_int(row.get("avg_latency_ms"))
+        row_count = _latency_count_value(row)
+        if avg_latency is None or row_count <= 0:
+            continue
+        weighted_total += avg_latency * row_count
+        weighted_count += row_count
+    if weighted_count <= 0:
+        return None
+    return round(weighted_total / weighted_count)
+
+
+def _latency_count_value(row: Mapping[str, Any]) -> int:
+    value = row.get("latency_count")
+    if value is None:
+        value = row.get("count")
+    return _count_value(value)
 
 
 def _provider_reason_from_payload(value: Any) -> str | None:

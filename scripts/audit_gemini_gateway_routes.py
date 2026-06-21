@@ -379,6 +379,8 @@ async def fetch_recent_attempt_rows(
             status,
             error_type,
             route_label,
+            source_service,
+            payload_kind,
             retry_count,
             provider_response_json->>'provider_reason' AS provider_reason,
             COUNT(*) AS count,
@@ -388,8 +390,8 @@ async def fetch_recent_attempt_rows(
         FROM gemini_gateway.route_attempts
         WHERE model = :model
           AND created_at >= CAST(:now AS timestamptz) - (CAST(:window_minutes AS integer) * interval '1 minute')
-        GROUP BY status, error_type, route_label, retry_count, provider_reason
-        ORDER BY COUNT(*) DESC, status ASC, error_type ASC, route_label ASC, retry_count ASC
+        GROUP BY status, error_type, route_label, source_service, payload_kind, retry_count, provider_reason
+        ORDER BY COUNT(*) DESC, status ASC, error_type ASC, route_label ASC, source_service ASC, payload_kind ASC, retry_count ASC
         """
     )
     async with session_factory() as session:
@@ -461,6 +463,8 @@ def summarize_recent_attempt_rows(
         "total_count": total_count,
         "status_counts": _counts_by_field(normalized_rows, "status"),
         "error_type_counts": _counts_by_field(normalized_rows, "error_type"),
+        "source_service_counts": _counts_by_field(normalized_rows, "source_service"),
+        "payload_kind_counts": _counts_by_field(normalized_rows, "payload_kind"),
         "retry_count_counts": _counts_by_field(normalized_rows, "retry_count"),
         "provider_reason_counts": _provider_reason_counts(normalized_rows),
         "failed_route_counts": _failed_route_counts(normalized_rows),
@@ -834,6 +838,8 @@ def _route_attempt_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[s
             "total_count": sum(_count_value(row.get("count")) for row in route_rows),
             "status_counts": _counts_by_field(route_rows, "status"),
             "error_type_counts": _counts_by_field(route_rows, "error_type"),
+            "source_service_counts": _counts_by_field(route_rows, "source_service"),
+            "payload_kind_counts": _counts_by_field(route_rows, "payload_kind"),
             "retry_count_counts": _counts_by_field(route_rows, "retry_count"),
             "provider_reason_counts": _provider_reason_counts(route_rows),
             **_optional_latency_summary_field(route_rows),

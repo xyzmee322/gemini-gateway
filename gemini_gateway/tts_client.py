@@ -7,6 +7,8 @@ import httpx
 from gemini_gateway.contracts import GatewayTTSRequest, GatewayTTSResponse
 from gemini_gateway.errors import GatewayError
 from gemini_gateway.gemini_client import (
+    _attach_provider_timing_to_gateway_error,
+    _provider_timing_from_exception,
     _raise_for_embedded_provider_error,
     _require_proxy_url,
     _timeout_error_kind,
@@ -15,6 +17,7 @@ from gemini_gateway.gemini_client import (
 )
 from gemini_gateway.http_client_pool import GatewayHttpClientPool
 from gemini_gateway.provider_http_errors import build_gateway_error_from_response
+from gemini_gateway.provider_observability import classify_tts_payload, send_timed_json, timing_to_dict
 from gemini_gateway.value_extractors import first_int_value, first_string_value
 
 
@@ -43,13 +46,18 @@ class GeminiTTSClient:
     ) -> GatewayTTSResponse:
         _require_proxy_url(proxy_url=proxy_url, request_id=request.request_id)
         payload = _tts_payload(request)
+        url = f"{self._base_url}/models/{_to_gemini_model_name(request.model)}:generateContent"
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         try:
             if self._client_pool is not None:
-                response = await self._client_pool.get(proxy_url=proxy_url).post(
-                    f"{self._base_url}/models/{_to_gemini_model_name(request.model)}:generateContent",
-                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=request.timeout_seconds,
+                result = await send_timed_json(
+                    client=self._client_pool.get(proxy_url=proxy_url),
+                    method="POST",
+                    url=url,
+                    headers=headers,
+                    payload=payload,
+                    payload_summary=classify_tts_payload(payload),
+                    timeout_seconds=request.timeout_seconds,
                 )
             else:
                 client_kwargs: dict[str, Any] = {"timeout": self._timeout, "trust_env": False}
@@ -58,11 +66,14 @@ class GeminiTTSClient:
                 elif proxy_url is not None:
                     client_kwargs["proxy"] = proxy_url
                 async with httpx.AsyncClient(**client_kwargs) as client:
-                    response = await client.post(
-                        f"{self._base_url}/models/{_to_gemini_model_name(request.model)}:generateContent",
-                        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                        json=payload,
-                        timeout=request.timeout_seconds,
+                    result = await send_timed_json(
+                        client=client,
+                        method="POST",
+                        url=url,
+                        headers=headers,
+                        payload=payload,
+                        payload_summary=classify_tts_payload(payload),
+                        timeout_seconds=request.timeout_seconds,
                     )
         except httpx.ProxyError as exc:
             raise GatewayError(
@@ -70,6 +81,7 @@ class GeminiTTSClient:
                 retryable=True,
                 provider_message_safe=str(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
         except httpx.TimeoutException as exc:
             raise GatewayError(
@@ -77,6 +89,7 @@ class GeminiTTSClient:
                 retryable=True,
                 provider_message_safe=_timeout_error_kind(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
         except httpx.HTTPError as exc:
             raise GatewayError(
@@ -84,35 +97,40 @@ class GeminiTTSClient:
                 retryable=True,
                 provider_message_safe=str(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
 
+        response = result.response
+        raw_response = result.payload
+        provider_timing = timing_to_dict(result.timing)
         if response.status_code >= 400:
-            raise build_gateway_error_from_response(
+            error = build_gateway_error_from_response(
                 response=response,
                 request_id=request.request_id,
                 supports_content_filter=False,
             )
+            _attach_provider_timing_to_gateway_error(error, provider_timing)
+            raise error
 
-        try:
-            raw_response = response.json()
-        except ValueError as exc:
-            raise GatewayError(
-                reason="invalid_response",
-                retryable=False,
-                provider_message_safe=str(exc),
-                request_id=request.request_id,
-                provider_called=True,
-            ) from exc
-        if not isinstance(raw_response, dict):
+        if raw_response is None:
             raise GatewayError(
                 reason="invalid_response",
                 retryable=False,
                 provider_message_safe="Gemini TTS response payload must be a JSON object",
                 request_id=request.request_id,
                 provider_called=True,
+                provider_timing=provider_timing,
             )
-        _raise_for_embedded_provider_error(raw_response=raw_response, request_id=request.request_id)
-        return _to_gateway_tts_response(request=request, raw_response=raw_response)
+        try:
+            _raise_for_embedded_provider_error(raw_response=raw_response, request_id=request.request_id)
+            return _to_gateway_tts_response(
+                request=request,
+                raw_response=raw_response,
+                provider_timing=provider_timing,
+            )
+        except GatewayError as exc:
+            _attach_provider_timing_to_gateway_error(exc, provider_timing)
+            raise
 
 
 def _tts_payload(request: GatewayTTSRequest) -> dict[str, Any]:
@@ -131,7 +149,12 @@ def _tts_payload(request: GatewayTTSRequest) -> dict[str, Any]:
     }
 
 
-def _to_gateway_tts_response(*, request: GatewayTTSRequest, raw_response: dict[str, Any]) -> GatewayTTSResponse:
+def _to_gateway_tts_response(
+    *,
+    request: GatewayTTSRequest,
+    raw_response: dict[str, Any],
+    provider_timing: dict[str, Any],
+) -> GatewayTTSResponse:
     inline_data = _first_inline_data(raw_response)
     if inline_data is None:
         raise GatewayError(
@@ -162,6 +185,7 @@ def _to_gateway_tts_response(*, request: GatewayTTSRequest, raw_response: dict[s
         finish_reason=_first_finish_reason(raw_response),
         raw_response=raw_response,
         provider_specific_fields=_provider_specific_fields(raw_response),
+        provider_timing=provider_timing,
     )
 
 

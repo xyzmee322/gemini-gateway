@@ -86,6 +86,7 @@ class GatewayError(RuntimeError):
         key_label: str | None = None,
         proxy_label: str | None = None,
         transport_mode: str | None = None,
+        provider_timing: dict[str, Any] | None = None,
     ) -> None:
         self.reason = reason
         self.request_id = request_id
@@ -112,6 +113,7 @@ class GatewayError(RuntimeError):
         self.key_label = _optional_string(key_label)
         self.proxy_label = _optional_string(proxy_label)
         self.transport_mode = _optional_string(transport_mode)
+        self.provider_timing = provider_timing or {}
         super().__init__(f"{reason}: {self.public_message}")
 
     def to_response(self) -> GatewayErrorResponse:

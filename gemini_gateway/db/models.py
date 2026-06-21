@@ -259,6 +259,8 @@ class RouteAttempt(GatewayTimestampMixin, GatewayBase):
         Index("ix_route_attempts_chat_created", "chat_id", "created_at"),
         Index("ix_route_attempts_project_model_created", "project_id", "model", "created_at"),
         Index("ix_route_attempts_status_error", "status", "error_type"),
+        Index("ix_route_attempts_proxy_created", "proxy_id", "created_at"),
+        Index("ix_route_attempts_operation_created", "operation_type", "created_at"),
         {"schema": GATEWAY_SCHEMA},
     )
 
@@ -288,3 +290,16 @@ class RouteAttempt(GatewayTimestampMixin, GatewayBase):
     generation_id: Mapped[str | None] = mapped_column(String(255))
     finish_reason: Mapped[str | None] = mapped_column(String(64))
     provider_response_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    operation_type: Mapped[str | None] = mapped_column(String(32))
+    payload_kind: Mapped[str | None] = mapped_column(String(32))
+    request_bytes: Mapped[int | None] = mapped_column(Integer)
+    response_bytes: Mapped[int | None] = mapped_column(Integer)
+    media_count: Mapped[int | None] = mapped_column(Integer)
+    image_count: Mapped[int | None] = mapped_column(Integer)
+    provider_total_ms: Mapped[int | None] = mapped_column(Integer)
+    request_prepare_ms: Mapped[int | None] = mapped_column(Integer)
+    response_headers_ms: Mapped[int | None] = mapped_column(Integer)
+    response_body_ms: Mapped[int | None] = mapped_column(Integer)
+    response_parse_ms: Mapped[int | None] = mapped_column(Integer)
+    timeout_kind: Mapped[str | None] = mapped_column(String(64))
+    timeout_stage: Mapped[str | None] = mapped_column(String(64))

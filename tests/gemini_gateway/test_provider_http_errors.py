@@ -43,3 +43,20 @@ def test_build_gateway_error_from_response_respects_content_filter_capability() 
 
     assert supported.reason == "content_filtered"
     assert unsupported.reason == "invalid_response"
+
+
+def test_build_gateway_error_from_response_handles_invalid_utf8_body() -> None:
+    response = httpx.Response(500, content=b"\xff")
+
+    error = build_gateway_error_from_response(
+        response=response,
+        request_id="req-invalid-utf8",
+        supports_content_filter=True,
+    )
+
+    assert error.reason == "provider_unavailable"
+    assert error.retryable is True
+    assert error.provider_status_code == 500
+    assert error.request_id == "req-invalid-utf8"
+    assert error.provider_message_safe is None
+    assert "UnicodeDecodeError" not in error.public_message

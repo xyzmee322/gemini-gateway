@@ -40,8 +40,8 @@ def extract_provider_message(response: httpx.Response) -> str | None:
 
     try:
         payload = response.json()
-    except json.JSONDecodeError:
-        return response.text[:500] if response.text else None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _safe_response_text(response)
 
     if isinstance(payload, dict):
         error = payload.get("error")
@@ -51,6 +51,14 @@ def extract_provider_message(response: httpx.Response) -> str | None:
         if isinstance(error, str):
             return error
     return None
+
+
+def _safe_response_text(response: httpx.Response) -> str | None:
+    try:
+        text = response.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text[:500] if text else None
 
 
 def parse_retry_after(value: str | None) -> int | None:

@@ -18,6 +18,7 @@ from gemini_gateway.contracts import (
 from gemini_gateway.errors import GatewayError, reason_from_gemini_status
 from gemini_gateway.http_client_pool import GatewayHttpClientPool
 from gemini_gateway.provider_http_errors import build_gateway_error_from_response
+from gemini_gateway.provider_observability import classify_chat_payload, send_timed_json, timing_to_dict
 
 _SUPPORTED_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "none"}
 _REASONING_EFFORT_ALIASES = {
@@ -84,11 +85,14 @@ class GeminiOpenAIClient:
         )
         try:
             if self._client_pool is not None:
-                response = await self._client_pool.get(proxy_url=proxy_url).post(
-                    f"{self._base_url}/chat/completions",
+                result = await send_timed_json(
+                    client=self._client_pool.get(proxy_url=proxy_url),
+                    method="POST",
+                    url=f"{self._base_url}/chat/completions",
                     headers=headers,
-                    json=payload,
-                    timeout=request.timeout_seconds,
+                    payload=payload,
+                    payload_summary=classify_chat_payload(payload),
+                    timeout_seconds=request.timeout_seconds,
                 )
             else:
                 client_kwargs: dict[str, Any] = {
@@ -100,11 +104,14 @@ class GeminiOpenAIClient:
                 elif proxy_url is not None:
                     client_kwargs["proxy"] = proxy_url
                 async with httpx.AsyncClient(**client_kwargs) as client:
-                    response = await client.post(
-                        f"{self._base_url}/chat/completions",
+                    result = await send_timed_json(
+                        client=client,
+                        method="POST",
+                        url=f"{self._base_url}/chat/completions",
                         headers=headers,
-                        json=payload,
-                        timeout=request.timeout_seconds,
+                        payload=payload,
+                        payload_summary=classify_chat_payload(payload),
+                        timeout_seconds=request.timeout_seconds,
                     )
         except httpx.ProxyError as exc:
             raise GatewayError(
@@ -112,6 +119,7 @@ class GeminiOpenAIClient:
                 retryable=True,
                 provider_message_safe=str(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
         except httpx.TimeoutException as exc:
             raise GatewayError(
@@ -119,6 +127,7 @@ class GeminiOpenAIClient:
                 retryable=True,
                 provider_message_safe=_timeout_error_kind(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
         except httpx.HTTPError as exc:
             raise GatewayError(
@@ -126,36 +135,47 @@ class GeminiOpenAIClient:
                 retryable=True,
                 provider_message_safe=str(exc),
                 request_id=request.request_id,
+                provider_timing=_provider_timing_from_exception(exc),
             ) from exc
 
+        response = result.response
+        raw_response = result.payload
+        provider_timing = timing_to_dict(result.timing)
         if response.status_code >= 400:
-            raise build_gateway_error_from_response(
+            error = build_gateway_error_from_response(
                 response=response,
                 request_id=request.request_id,
                 supports_content_filter=True,
             )
+            _attach_provider_timing_to_gateway_error(error, provider_timing)
+            raise error
 
-        try:
-            raw_response = response.json()
-        except ValueError as exc:
-            raise GatewayError(
-                reason="invalid_response",
-                retryable=False,
-                provider_message_safe=str(exc),
-                request_id=request.request_id,
-                provider_called=True,
-            ) from exc
-        if not isinstance(raw_response, dict):
+        if raw_response is None:
             raise GatewayError(
                 reason="invalid_response",
                 retryable=False,
                 provider_message_safe="Gemini response payload must be a JSON object",
                 request_id=request.request_id,
                 provider_called=True,
+                provider_timing=provider_timing,
             )
-        return self._to_gateway_response(request=request, raw_response=raw_response)
+        try:
+            return self._to_gateway_response(
+                request=request,
+                raw_response=raw_response,
+                provider_timing=provider_timing,
+            )
+        except GatewayError as exc:
+            _attach_provider_timing_to_gateway_error(exc, provider_timing)
+            raise
 
-    def _to_gateway_response(self, *, request: GatewayChatRequest, raw_response: dict[str, Any]) -> GatewayChatResponse:
+    def _to_gateway_response(
+        self,
+        *,
+        request: GatewayChatRequest,
+        raw_response: dict[str, Any],
+        provider_timing: dict[str, Any],
+    ) -> GatewayChatResponse:
         _raise_for_embedded_provider_error(raw_response=raw_response, request_id=request.request_id)
         raw_choices = raw_response.get("choices")
         if not isinstance(raw_choices, list) or not raw_choices or not isinstance(raw_choices[0], dict):
@@ -188,6 +208,7 @@ class GeminiOpenAIClient:
             finish_reason=finish_reason,
             raw_response=raw_response,
             provider_specific_fields=provider_specific_fields,
+            provider_timing=provider_timing,
         )
 
 
@@ -250,6 +271,20 @@ def _transport_error_reason(proxy_url: str | None) -> GatewayErrorReason:
     if proxy_url:
         return "proxy_failed"
     return "provider_unavailable"
+
+
+def _provider_timing_from_exception(exc: Exception) -> dict[str, Any]:
+    """Возвращает безопасный timing, прикрепленный transport helper-ом."""
+
+    return timing_to_dict(getattr(exc, "provider_timing", None))
+
+
+def _attach_provider_timing_to_gateway_error(error: GatewayError, provider_timing: dict[str, Any]) -> None:
+    """Добавляет timing к доменной ошибке без изменения публичного ответа."""
+
+    if error.provider_timing:
+        return
+    error.provider_timing = provider_timing
 
 
 def _timeout_error_kind(exc: httpx.TimeoutException) -> str:

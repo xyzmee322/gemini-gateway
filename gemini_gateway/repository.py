@@ -25,6 +25,7 @@ from gemini_gateway.contracts import (
 )
 from gemini_gateway.cooldown import CooldownDecision, CooldownPolicy
 from gemini_gateway.errors import GatewayError, public_message_for_reason, public_provider_reason
+from gemini_gateway.provider_observability import provider_timing_columns
 from gemini_gateway.security import (
     ProxySecretParts,
     SecretVault,
@@ -816,6 +817,7 @@ class PostgresGatewayRepository:
         prompt_tokens = _safe_int(usage.get("prompt_tokens"))
         completion_tokens = _safe_int(usage.get("completion_tokens"))
         total_tokens = _safe_int(usage.get("total_tokens"))
+        provider_timing = provider_timing_columns(getattr(response, "provider_timing", None))
         minute_start = _minute_start(lease.leased_at)
         day_start = _day_start(lease.leased_at)
         async with self._session_factory() as session, session.begin():
@@ -831,6 +833,19 @@ class PostgresGatewayRepository:
                         generation_id = :generation_id,
                         finish_reason = :finish_reason,
                         provider_response_json = CAST(:provider_response_json AS jsonb),
+                        operation_type = :operation_type,
+                        payload_kind = :payload_kind,
+                        request_bytes = :request_bytes,
+                        response_bytes = :response_bytes,
+                        media_count = :media_count,
+                        image_count = :image_count,
+                        provider_total_ms = :provider_total_ms,
+                        request_prepare_ms = :request_prepare_ms,
+                        response_headers_ms = :response_headers_ms,
+                        response_body_ms = :response_body_ms,
+                        response_parse_ms = :response_parse_ms,
+                        timeout_kind = :timeout_kind,
+                        timeout_stage = :timeout_stage,
                         updated_at = now()
                     WHERE id = :attempt_id
                     """
@@ -844,6 +859,7 @@ class PostgresGatewayRepository:
                     "generation_id": response.generation_id,
                     "finish_reason": response.finish_reason,
                     "provider_response_json": json.dumps(_safe_provider_response_json(response), ensure_ascii=False),
+                    **provider_timing,
                 },
             )
             await self._reconcile_windows(
@@ -894,6 +910,7 @@ class PostgresGatewayRepository:
         provider_called: bool,
     ) -> None:
         route_failure = _should_apply_route_failure_state(error=error, provider_called=provider_called)
+        provider_timing = provider_timing_columns(getattr(error, "provider_timing", None))
         async with self._session_factory() as session, session.begin():
             if lease is not None:
                 await session.execute(
@@ -906,6 +923,19 @@ class PostgresGatewayRepository:
                             retryable = :retryable,
                             latency_ms = :latency_ms,
                             provider_response_json = CAST(:provider_response_json AS jsonb),
+                            operation_type = :operation_type,
+                            payload_kind = :payload_kind,
+                            request_bytes = :request_bytes,
+                            response_bytes = :response_bytes,
+                            media_count = :media_count,
+                            image_count = :image_count,
+                            provider_total_ms = :provider_total_ms,
+                            request_prepare_ms = :request_prepare_ms,
+                            response_headers_ms = :response_headers_ms,
+                            response_body_ms = :response_body_ms,
+                            response_parse_ms = :response_parse_ms,
+                            timeout_kind = :timeout_kind,
+                            timeout_stage = :timeout_stage,
                             updated_at = now()
                         WHERE id = :attempt_id
                         """
@@ -920,6 +950,7 @@ class PostgresGatewayRepository:
                             _safe_provider_failure_json(error),
                             ensure_ascii=False,
                         ),
+                        **provider_timing,
                     },
                 )
                 if not provider_called:
@@ -2396,19 +2427,66 @@ def _attach_cooldown_metadata(
 
 
 def _safe_provider_response_json(response: Any) -> dict[str, Any]:
-    """Готовит provider response для БД без base64-медиа и секретных полей."""
+    """Готовит безопасную metadata-схему provider response для БД."""
 
-    raw_response = getattr(response, "raw_response", None)
+    payload = _response_public_mapping(response)
+    safe_payload: dict[str, Any] = {}
+    for field_name in ("request_id", "model", "generation_id", "finish_reason"):
+        value = _response_field(response, payload, field_name)
+        if value is not None:
+            safe_payload[field_name] = value
+
+    usage = _response_field(response, payload, "usage")
+    safe_payload["usage"] = _safe_usage_metadata(usage)
+    provider_specific_fields = _response_field(response, payload, "provider_specific_fields")
+    safe_payload["provider_specific_fields"] = sanitize_payload_for_audit(
+        {"provider_specific_fields": provider_specific_fields if isinstance(provider_specific_fields, dict) else {}}
+    ).get("provider_specific_fields", {})
+    safe_payload["route"] = _safe_route_metadata(_response_field(response, payload, "route"))
+    for field_name in ("route_label", "project_label", "key_label", "proxy_label", "transport_mode"):
+        value = _response_field(response, payload, field_name)
+        if value is not None:
+            safe_payload[field_name] = value
+    safe_payload["provider_timing"] = provider_timing_columns(_response_field(response, payload, "provider_timing"))
+    return sanitize_payload_for_audit(safe_payload)
+
+
+def _response_public_mapping(response: Any) -> dict[str, Any]:
     if hasattr(response, "model_dump"):
-        payload = response.model_dump(mode="json")
-    elif isinstance(raw_response, dict) and raw_response:
-        payload = dict(raw_response)
-    elif isinstance(response, dict):
-        payload = dict(response)
-    else:
-        payload = {key: value for key, value in vars(response).items() if not key.startswith("_")}
-    payload.pop("raw_response", None)
-    return sanitize_payload_for_audit(payload)
+        return response.model_dump(mode="json")
+    if isinstance(response, dict):
+        return dict(response)
+    return {key: value for key, value in vars(response).items() if not key.startswith("_")}
+
+
+def _response_field(response: Any, payload: dict[str, Any], field_name: str) -> Any:
+    if hasattr(response, field_name):
+        return getattr(response, field_name)
+    return payload.get(field_name)
+
+
+def _safe_usage_metadata(value: Any) -> dict[str, int | float]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if isinstance(item, (int, float)) and not isinstance(item, bool)
+    }
+
+
+def _safe_route_metadata(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in ("route_label", "project_label", "key_label", "proxy_label", "transport_mode")
+        if value.get(key) is not None
+    }
 
 
 def _safe_provider_failure_json(error: GatewayError) -> dict[str, Any]:

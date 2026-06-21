@@ -73,6 +73,11 @@ async def test_tts_client_forwards_native_payload_and_preserves_audio_response()
     assert response.audio_mime_type == "audio/wav"
     assert response.generation_id == "tts-1"
     assert response.usage == {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
+    assert response.provider_timing["operation_type"] == "tts"
+    assert response.provider_timing["payload_kind"] == "tts"
+    assert response.provider_timing["request_bytes"] > 0
+    assert response.provider_timing["response_bytes"] > 0
+    assert response.provider_timing["response_headers_ms"] is not None
 
 
 @pytest.mark.asyncio
@@ -285,6 +290,34 @@ async def test_tts_client_records_stable_timeout_kind_without_raw_transport_text
     error = exc_info.value
     assert error.reason == "network_timeout"
     assert error.provider_message_safe == "pool_timeout"
+    assert "AIza-secret" not in str(error.provider_message_safe)
+
+
+@pytest.mark.asyncio
+async def test_tts_client_exposes_provider_timing_for_read_timeout() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timeout with api_key=AIza-secret", request=request)
+
+    client = GeminiTTSClient(base_url="https://example.test/v1beta", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.synthesize(
+            request=GatewayTTSRequest(
+                request_id="req-tts-read-timeout",
+                source_service="voice_tts",
+                model="google/gemini-3.1-flash-tts-preview",
+                text="привет",
+            ),
+            api_key="AIza-secret",
+            proxy_url=_PROXY_URL,
+        )
+
+    error = exc_info.value
+    assert error.reason == "network_timeout"
+    assert error.provider_message_safe == "read_timeout"
+    assert error.provider_timing["timeout_kind"] == "read_timeout"
+    assert error.provider_timing["timeout_stage"] == "response_headers"
+    assert error.provider_timing["request_bytes"] > 0
     assert "AIza-secret" not in str(error.provider_message_safe)
 
 

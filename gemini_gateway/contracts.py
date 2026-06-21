@@ -167,6 +167,7 @@ class GatewayTTSResponse(BaseModel):
     generation_id: str | None = None
     finish_reason: str | None = None
     provider_specific_fields: dict[str, Any] = Field(default_factory=dict)
+    provider_timing: dict[str, Any] = Field(default_factory=dict, exclude=True)
     raw_response: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @field_validator("provider_specific_fields", mode="before")
@@ -209,6 +210,7 @@ class GatewayChatResponse(BaseModel):
     generation_id: str | None = None
     finish_reason: str | None = None
     provider_specific_fields: dict[str, Any] = Field(default_factory=dict)
+    provider_timing: dict[str, Any] = Field(default_factory=dict, exclude=True)
     raw_response: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @field_validator("choices", mode="before")
@@ -254,6 +256,7 @@ class GatewayEmbeddingResponse(BaseModel):
     generation_id: str | None = None
     finish_reason: str | None = None
     provider_specific_fields: dict[str, Any] = Field(default_factory=dict)
+    provider_timing: dict[str, Any] = Field(default_factory=dict, exclude=True)
     raw_response: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @field_validator("provider_specific_fields", mode="before")

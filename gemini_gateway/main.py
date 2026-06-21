@@ -74,6 +74,7 @@ def build_app():
         auth_token=settings.internal_auth_token.get_secret_value(),
         completion_service=service,
         readiness_check=lambda: service.health_check(require_routes=settings.require_seeded_routes),
+        monitoring_session_factory=session_factory,
         service_name=settings.service_name,
         environment=settings.environment,
     )

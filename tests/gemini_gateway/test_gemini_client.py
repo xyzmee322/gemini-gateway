@@ -79,6 +79,11 @@ async def test_client_forwards_openai_payload_and_preserves_provider_response() 
     assert response.raw_response["safety_ratings"][0]["category"] == "safe"
     assert response.provider_specific_fields["thought_signature"] == "opaque"
     assert "reasoning" not in response.provider_specific_fields
+    assert response.provider_timing["operation_type"] == "chat"
+    assert response.provider_timing["payload_kind"] == "text"
+    assert response.provider_timing["request_bytes"] > 0
+    assert response.provider_timing["response_bytes"] > 0
+    assert response.provider_timing["response_headers_ms"] is not None
 
 
 @pytest.mark.asyncio
@@ -361,6 +366,47 @@ async def test_client_normalizes_multimodal_tool_result_for_gemini_openai_payloa
 
 
 @pytest.mark.asyncio
+async def test_client_exposes_provider_timing_for_media_payload() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "gen-media-timing",
+                "model": "gemini-3.5-flash",
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {},
+            },
+        )
+
+    client = GeminiOpenAIClient(base_url="https://example.test/openai", transport=httpx.MockTransport(handler))
+
+    response = await client.complete(
+        request=GatewayChatRequest(
+            request_id="req-media-timing",
+            source_service="test",
+            model="google/gemini-3.5-flash",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "что на картинке?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,ZmFrZS1qcGc="}},
+                    ],
+                }
+            ],
+        ),
+        api_key="AIza-test-key",
+        proxy_url=_PROXY_URL,
+    )
+
+    assert response.provider_timing["operation_type"] == "chat"
+    assert response.provider_timing["payload_kind"] == "media"
+    assert response.provider_timing["request_bytes"] > 0
+    assert response.provider_timing["response_bytes"] > 0
+    assert response.provider_timing["response_headers_ms"] is not None
+
+
+@pytest.mark.asyncio
 async def test_client_raises_safe_gateway_error_for_provider_error() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -389,6 +435,61 @@ async def test_client_raises_safe_gateway_error_for_provider_error() -> None:
     assert error.public_message
     assert "AIza-secret" not in str(error)
     assert "HTTP 429" not in error.public_message
+
+
+@pytest.mark.asyncio
+async def test_client_preserves_provider_timing_for_non_json_http_error() -> None:
+    body = b"upstream unavailable"
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=body)
+
+    client = GeminiOpenAIClient(base_url="https://example.test/openai", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.complete(
+            request=GatewayChatRequest(
+                request_id="req-non-json-500",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hi"}],
+            ),
+            api_key="AIza-secret",
+            proxy_url=_PROXY_URL,
+        )
+
+    error = exc_info.value
+    assert error.reason == "provider_unavailable"
+    assert error.provider_timing["response_bytes"] == len(body)
+    assert error.provider_timing["request_bytes"] > 0
+
+
+@pytest.mark.asyncio
+async def test_client_maps_invalid_utf8_http_error_and_preserves_provider_timing() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"\xff")
+
+    client = GeminiOpenAIClient(base_url="https://example.test/openai", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.complete(
+            request=GatewayChatRequest(
+                request_id="req-invalid-utf8-500",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hi"}],
+            ),
+            api_key="AIza-secret",
+            proxy_url=_PROXY_URL,
+        )
+
+    error = exc_info.value
+    assert error.reason == "provider_unavailable"
+    assert error.provider_status_code == 500
+    assert error.provider_timing["response_bytes"] == 1
+    assert error.provider_timing["request_bytes"] > 0
+    assert error.provider_message_safe is None
+    assert "UnicodeDecodeError" not in error.public_message
 
 
 @pytest.mark.asyncio
@@ -577,6 +678,10 @@ async def test_client_maps_proxy_transport_error_to_proxy_failed() -> None:
     assert error.reason == "proxy_failed"
     assert error.retryable is True
     assert error.provider_called is False
+    assert error.provider_timing["operation_type"] == "chat"
+    assert error.provider_timing["request_bytes"] > 0
+    assert error.provider_timing["timeout_kind"] is None
+    assert error.provider_timing["timeout_stage"] is None
 
 
 @pytest.mark.asyncio
@@ -601,6 +706,9 @@ async def test_client_records_stable_timeout_kind_without_raw_transport_text() -
     error = exc_info.value
     assert error.reason == "network_timeout"
     assert error.provider_message_safe == "read_timeout"
+    assert error.provider_timing["timeout_kind"] == "read_timeout"
+    assert error.provider_timing["timeout_stage"] == "response_headers"
+    assert error.provider_timing["request_bytes"] > 0
     assert "AIza-secret" not in str(error.provider_message_safe)
 
 

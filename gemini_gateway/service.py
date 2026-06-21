@@ -28,6 +28,7 @@ from gemini_gateway.repository import (
     ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
     InMemoryRouteRepository,
 )
+from gemini_gateway.provider_observability import provider_timing_columns
 from gemini_gateway.tts_client import GeminiTTSClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -475,7 +476,7 @@ def _normalize_optional_secret(value: str | None) -> str | None:
 
 def _success_log_fields(response: GatewayProviderResponse) -> dict[str, Any]:
     usage = response.usage or {}
-    return {
+    fields = {
         "prompt_tokens": _safe_int(usage.get("prompt_tokens")),
         "completion_tokens": _safe_int(usage.get("completion_tokens")),
         "total_tokens": _safe_int(usage.get("total_tokens")),
@@ -494,10 +495,12 @@ def _success_log_fields(response: GatewayProviderResponse) -> dict[str, Any]:
         "exhausted_routes_count": None,
         "disabled_routes_count": None,
     }
+    fields.update(provider_timing_columns(getattr(response, "provider_timing", None)))
+    return fields
 
 
 def _failure_log_fields(error: GatewayError, failed_stage: str) -> dict[str, Any]:
-    return {
+    fields = {
         "prompt_tokens": None,
         "completion_tokens": None,
         "total_tokens": None,
@@ -520,6 +523,8 @@ def _failure_log_fields(error: GatewayError, failed_stage: str) -> dict[str, Any
         "exhausted_routes_count": getattr(error, "exhausted_routes_count", None),
         "disabled_routes_count": getattr(error, "disabled_routes_count", None),
     }
+    fields.update(provider_timing_columns(getattr(error, "provider_timing", None)))
+    return fields
 
 
 def _serialize_datetime(value: Any) -> str | None:

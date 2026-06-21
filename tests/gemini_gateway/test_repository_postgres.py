@@ -331,6 +331,23 @@ def _model(suffix: str) -> str:
     return f"google/gemini-postgres-test-{suffix}"
 
 
+_PROVIDER_TIMING_COLUMNS = (
+    "operation_type",
+    "payload_kind",
+    "request_bytes",
+    "response_bytes",
+    "media_count",
+    "image_count",
+    "provider_total_ms",
+    "request_prepare_ms",
+    "response_headers_ms",
+    "response_body_ms",
+    "response_parse_ms",
+    "timeout_kind",
+    "timeout_stage",
+)
+
+
 @pytest.mark.asyncio
 async def test_postgres_attempt_stores_request_metadata(postgres_context: PostgresTestContext) -> None:
     session_factory = postgres_context.session_factory
@@ -388,6 +405,112 @@ async def test_postgres_attempt_stores_gateway_retry_count(postgres_context: Pos
         )
 
     assert retry_count == 3
+
+
+@pytest.mark.asyncio
+async def test_postgres_record_success_persists_provider_timing(postgres_context: PostgresTestContext) -> None:
+    session_factory = postgres_context.session_factory
+    repository = postgres_context.repository
+    suffix = postgres_context.suffix
+    await postgres_context.seed_repository.upsert_seed_config(_seed_config(suffix))
+    request = _request(suffix)
+    lease = await repository.acquire_route(request)
+    expected_timing = {
+        "operation_type": "chat",
+        "payload_kind": "media",
+        "request_bytes": 2048,
+        "response_bytes": 512,
+        "media_count": 2,
+        "image_count": 2,
+        "provider_total_ms": 1200,
+        "request_prepare_ms": 2,
+        "response_headers_ms": 900,
+        "response_body_ms": 100,
+        "response_parse_ms": 3,
+        "timeout_kind": None,
+        "timeout_stage": None,
+    }
+
+    await repository.record_success(
+        lease,
+        GatewayChatResponse(
+            request_id=request.request_id,
+            model=request.model,
+            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            provider_timing=expected_timing,
+        ),
+        latency_ms=1205,
+    )
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT {", ".join(_PROVIDER_TIMING_COLUMNS)}
+                    FROM gemini_gateway.route_attempts
+                    WHERE id = :attempt_id
+                    """
+                ),
+                {"attempt_id": lease.attempt_id},
+            )
+        ).mappings().one()
+
+    assert dict(row) == expected_timing
+
+
+@pytest.mark.asyncio
+async def test_postgres_record_failure_persists_provider_timing(postgres_context: PostgresTestContext) -> None:
+    session_factory = postgres_context.session_factory
+    repository = postgres_context.repository
+    suffix = postgres_context.suffix
+    await postgres_context.seed_repository.upsert_seed_config(_seed_config(suffix))
+    request = _request(suffix)
+    lease = await repository.acquire_route(request)
+    expected_timing = {
+        "operation_type": "chat",
+        "payload_kind": "media",
+        "request_bytes": 4096,
+        "response_bytes": None,
+        "media_count": 2,
+        "image_count": 2,
+        "provider_total_ms": 30000,
+        "request_prepare_ms": 4,
+        "response_headers_ms": None,
+        "response_body_ms": None,
+        "response_parse_ms": None,
+        "timeout_kind": "read_timeout",
+        "timeout_stage": "response_headers",
+    }
+
+    await repository.record_failure(
+        lease,
+        GatewayError(
+            reason="network_timeout",
+            retryable=True,
+            request_id=request.request_id,
+            provider_timing=expected_timing,
+        ),
+        latency_ms=30001,
+        provider_called=True,
+    )
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT {", ".join(_PROVIDER_TIMING_COLUMNS)}
+                    FROM gemini_gateway.route_attempts
+                    WHERE id = :attempt_id
+                    """
+                ),
+                {"attempt_id": lease.attempt_id},
+            )
+        ).mappings().one()
+
+    assert dict(row) == expected_timing
 
 
 @pytest.mark.asyncio

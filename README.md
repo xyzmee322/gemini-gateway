@@ -12,6 +12,21 @@
 
 Авторизация: `Authorization: Bearer <GEMINI_GATEWAY_TOKEN>`.
 
+## Мониторинг proxy
+
+- `GET /admin/monitor` отдаёт HTML-дашборд без bearer-авторизации на саму страницу.
+- JSON API остаётся закрытым bearer-токеном: `GET /admin/monitor/api/summary` и `GET /admin/monitor/api/timeseries`.
+- В форме дашборда укажи token, minutes, bucket_seconds, model, proxy_label и refresh_seconds. Токен хранится локально в браузере и отправляется только в заголовке `Authorization: Bearer <token>`.
+- При включённом auto дашборд сам обновляет summary и timeseries, поэтому его можно держать открытым как real-time экран состояния proxy.
+
+Как читать latency stages:
+
+- высокий `response_headers_ms` означает, что запрос уже ушёл к провайдеру через proxy, и gateway ждёт первые headers;
+- высокий `response_body_ms` означает, что headers получены, но тело ответа читается медленно;
+- `timeout_kind=write_timeout` указывает на проблему отправки тела запроса;
+- `timeout_kind=read_timeout` вместе с `timeout_stage=response_headers` означает ожидание первого ответа от провайдера;
+- `payload_kind=media` отделяет медиа-запросы от текстовых, чтобы не смешивать разные профили latency.
+
 ## Локальный запуск
 
 ```powershell

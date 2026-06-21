@@ -240,34 +240,114 @@ def test_route_scorer_allows_proxy_candidates_before_secret_decryption() -> None
 
 def test_gateway_repository_omits_raw_provider_response_from_attempt_payload() -> None:
     audio_base64 = "UklGRg==" * 4096
-    response = GatewayTTSResponse(
+    chat_response = GatewayChatResponse(
+        request_id="req-chat",
+        model="gemini-3.5-flash",
+        generation_id="gen-chat",
+        choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "raw assistant text"}}],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        provider_timing={
+            "operation_type": "chat",
+            "payload_kind": "media",
+            "request_bytes": 2048,
+            "response_bytes": 512,
+            "media_count": 2,
+            "image_count": 2,
+            "provider_total_ms": 1200,
+            "request_prepare_ms": 2,
+            "response_headers_ms": 900,
+            "response_body_ms": 100,
+            "response_parse_ms": 3,
+            "headers": {"authorization": "Bearer secret"},
+            "response_body": "raw provider body",
+            "proxy_url": "http://user:pass@127.0.0.1:8000",
+        },
+        raw_response={"body": "raw response body"},
+    )
+    tts_response = GatewayTTSResponse(
         request_id="req-tts",
         model="google/gemini-tts",
         audio_base64=audio_base64,
         audio_mime_type="audio/wav",
-        raw_response={
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "inlineData": {
-                                    "mimeType": "audio/wav",
-                                    "data": audio_base64,
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        },
+        provider_timing={"operation_type": "tts", "payload_kind": "tts", "request_bytes": 33},
+    )
+    embedding_response = GatewayEmbeddingResponse(
+        request_id="req-embedding",
+        model="google/gemini-embedding-2",
+        embedding=[0.1, 0.2, 0.3],
+        dimensions=3,
+        provider_timing={"operation_type": "embedding", "payload_kind": "text", "request_bytes": 44},
     )
 
-    payload = _safe_provider_response_json(response)
+    payload = _safe_provider_response_json(chat_response)
+    tts_payload = _safe_provider_response_json(tts_response)
+    embedding_payload = _safe_provider_response_json(embedding_response)
     serialized = json.dumps(payload, ensure_ascii=False)
+    all_payloads = json.dumps([payload, tts_payload, embedding_payload], ensure_ascii=False)
 
-    assert audio_base64 not in serialized
-    assert payload["audio_base64"].startswith("<audio:")
+    assert payload == {
+        "request_id": "req-chat",
+        "model": "gemini-3.5-flash",
+        "generation_id": "gen-chat",
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "provider_specific_fields": {},
+        "route": {},
+        "provider_timing": {
+            "operation_type": "chat",
+            "payload_kind": "media",
+            "request_bytes": 2048,
+            "response_bytes": 512,
+            "media_count": 2,
+            "image_count": 2,
+            "provider_total_ms": 1200,
+            "request_prepare_ms": 2,
+            "response_headers_ms": 900,
+            "response_body_ms": 100,
+            "response_parse_ms": 3,
+            "timeout_kind": None,
+            "timeout_stage": None,
+        },
+    }
+    assert tts_payload["provider_timing"] == {
+        "operation_type": "tts",
+        "payload_kind": "tts",
+        "request_bytes": 33,
+        "response_bytes": None,
+        "media_count": None,
+        "image_count": None,
+        "provider_total_ms": None,
+        "request_prepare_ms": None,
+        "response_headers_ms": None,
+        "response_body_ms": None,
+        "response_parse_ms": None,
+        "timeout_kind": None,
+        "timeout_stage": None,
+    }
+    assert embedding_payload["provider_timing"] == {
+        "operation_type": "embedding",
+        "payload_kind": "text",
+        "request_bytes": 44,
+        "response_bytes": None,
+        "media_count": None,
+        "image_count": None,
+        "provider_total_ms": None,
+        "request_prepare_ms": None,
+        "response_headers_ms": None,
+        "response_body_ms": None,
+        "response_parse_ms": None,
+        "timeout_kind": None,
+        "timeout_stage": None,
+    }
+    assert "choices" not in payload
+    assert "raw assistant text" not in serialized
+    assert "raw response body" not in serialized
+    assert "audio_base64" not in tts_payload
+    assert audio_base64 not in all_payloads
+    assert "embedding" not in embedding_payload
+    assert "Bearer secret" not in all_payloads
+    assert "raw provider body" not in all_payloads
+    assert "user:pass" not in all_payloads
     assert "raw_response" not in payload
     assert "candidates" not in payload
 
@@ -461,6 +541,23 @@ async def test_completion_service_uses_selected_route_proxy_and_logs_safe_wide_e
                 model=request.model,
                 choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
                 usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                provider_timing={
+                    "operation_type": "chat",
+                    "payload_kind": "text",
+                    "request_bytes": 128,
+                    "response_bytes": 64,
+                    "media_count": 0,
+                    "image_count": 0,
+                    "provider_total_ms": 25,
+                    "request_prepare_ms": 1,
+                    "response_headers_ms": 20,
+                    "response_body_ms": 2,
+                    "response_parse_ms": 1,
+                    "timeout_kind": None,
+                    "timeout_stage": None,
+                    "headers": {"authorization": api_key},
+                    "response_body": "raw provider body",
+                },
                 raw_response={"id": "gen-1"},
             )
 
@@ -505,9 +602,24 @@ async def test_completion_service_uses_selected_route_proxy_and_logs_safe_wide_e
     assert record.generation_id == "gen-1"
     assert record.prompt_tokens == 3
     assert record.finish_reason == "stop"
+    assert record.operation_type == "chat"
+    assert record.payload_kind == "text"
+    assert record.request_bytes == 128
+    assert record.response_bytes == 64
+    assert record.media_count == 0
+    assert record.image_count == 0
+    assert record.provider_total_ms == 25
+    assert record.request_prepare_ms == 1
+    assert record.response_headers_ms == 20
+    assert record.response_body_ms == 2
+    assert record.response_parse_ms == 1
+    assert record.timeout_kind is None
+    assert record.timeout_stage is None
     record_payload = json.dumps(record.__dict__, ensure_ascii=False, default=str)
     assert "AIza-super-secret" not in record_payload
     assert "user:pass" not in record_payload
+    assert "authorization" not in record_payload
+    assert "raw provider body" not in record_payload
 
 
 @pytest.mark.asyncio
@@ -567,6 +679,23 @@ async def test_completion_service_records_failure_applies_cooldown_and_logs_safe
                 provider_status_code=429,
                 provider_message_safe=f"HTTP 429 for {api_key} via {proxy_url}",
                 request_id=request.request_id,
+                provider_timing={
+                    "operation_type": "chat",
+                    "payload_kind": "media",
+                    "request_bytes": 2048,
+                    "response_bytes": 512,
+                    "media_count": 2,
+                    "image_count": 2,
+                    "provider_total_ms": 1200,
+                    "request_prepare_ms": 2,
+                    "response_headers_ms": 900,
+                    "response_body_ms": 100,
+                    "response_parse_ms": 3,
+                    "timeout_kind": "read_timeout",
+                    "timeout_stage": "response_headers",
+                    "cookies": "session=secret",
+                    "raw_body": "raw failure body",
+                },
             )
 
     repository = InMemoryRouteRepository(
@@ -608,10 +737,25 @@ async def test_completion_service_records_failure_applies_cooldown_and_logs_safe
     assert record.cooldown_scope == "project_model"
     assert record.cooldown_level == 1
     assert record.sleep_until is not None
+    assert record.operation_type == "chat"
+    assert record.payload_kind == "media"
+    assert record.request_bytes == 2048
+    assert record.response_bytes == 512
+    assert record.media_count == 2
+    assert record.image_count == 2
+    assert record.provider_total_ms == 1200
+    assert record.request_prepare_ms == 2
+    assert record.response_headers_ms == 900
+    assert record.response_body_ms == 100
+    assert record.response_parse_ms == 3
+    assert record.timeout_kind == "read_timeout"
+    assert record.timeout_stage == "response_headers"
     payload = json.dumps(record.__dict__, ensure_ascii=False, default=str)
     assert "AIza-super-secret" not in payload
     assert "user:pass" not in payload
     assert "HTTP 429" not in payload
+    assert "session=secret" not in payload
+    assert "raw failure body" not in payload
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,7 @@ def test_gateway_compose_wires_openrouter_fallback_env() -> None:
     compose_config = _load_compose_config()
     environment = _service_environment(compose_config, "gateway")
 
+    assert environment["GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS"] == "${GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS:-5}"
     assert environment["GEMINI_GATEWAY_OPENROUTER_API_KEY"] == "${GEMINI_GATEWAY_OPENROUTER_API_KEY:-}"
     assert (
         environment["GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED"]
@@ -68,6 +69,7 @@ def test_dev_compose_wires_openrouter_fallback_env() -> None:
 
     environment = _service_environment(compose_config, "gateway")
 
+    assert environment["GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS"] == "${GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS:-5}"
     assert environment["GEMINI_GATEWAY_OPENROUTER_API_KEY"] == "${GEMINI_GATEWAY_OPENROUTER_API_KEY:-}"
     assert (
         environment["GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED"]

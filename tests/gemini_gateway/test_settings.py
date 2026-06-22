@@ -18,6 +18,20 @@ def test_gateway_settings_load_prefixed_env(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert settings.postgres_dsn.startswith("postgresql+asyncpg://")
     assert settings.internal_auth_token.get_secret_value() == "secret-token-value"
+    assert settings.max_route_attempts == 5
+
+
+def test_gateway_settings_load_max_route_attempts_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS", "7")
+
+    settings = GeminiGatewaySettings()
+
+    assert settings.max_route_attempts == 7
 
 
 def test_gateway_settings_reject_placeholder_outside_dev(monkeypatch: pytest.MonkeyPatch) -> None:

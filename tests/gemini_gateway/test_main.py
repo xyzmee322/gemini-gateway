@@ -12,6 +12,14 @@ def test_gateway_main_passes_environment_to_api_app() -> None:
     assert "service_name=settings.service_name" in source[app_start:app_end]
 
 
+def test_gateway_main_passes_max_route_attempts_to_completion_service() -> None:
+    source = Path("gemini_gateway/main.py").read_text(encoding="utf-8")
+    service_start = source.index("service = CompletionService(")
+    service_end = source.index("    app = create_app(")
+
+    assert "max_route_attempts=settings.max_route_attempts" in source[service_start:service_end]
+
+
 def test_gateway_main_passes_service_name_to_retention_service() -> None:
     source = Path("gemini_gateway/main.py").read_text(encoding="utf-8")
     retention_start = source.index("retention_service = GatewayRetentionService(")

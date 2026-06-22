@@ -34,9 +34,21 @@ from gemini_gateway.tts_client import GeminiTTSClient
 _LOGGER = logging.getLogger(__name__)
 ResponseT = TypeVar("ResponseT", bound=GatewayProviderResponse)
 _OPENROUTER_EMBEDDING_FALLBACK_MODEL = "google/gemini-embedding-2"
-_OPENROUTER_EMBEDDING_FALLBACK_REASONS = frozenset({"no_route", "cooldown_active", "quota_exhausted"})
+_OPENROUTER_EMBEDDING_FALLBACK_REASONS = frozenset(
+    {
+        "no_route",
+        "cooldown_active",
+        "quota_exhausted",
+        "rate_limited",
+        "proxy_failed",
+        "network_timeout",
+        "provider_unavailable",
+        "request_failed",
+    }
+)
 _OPENROUTER_EMBEDDING_FALLBACK_STAGE = "openrouter_embedding_fallback"
 _OPENROUTER_FALLBACK_PROVIDER = "openrouter"
+_DEFAULT_MAX_ROUTE_ATTEMPTS = 5
 
 
 class CompletionService:
@@ -53,6 +65,7 @@ class CompletionService:
         openrouter_api_key: str | None = None,
         openrouter_embeddings_fallback_enabled: bool = False,
         openrouter_embeddings_fallback_model: str = _OPENROUTER_EMBEDDING_FALLBACK_MODEL,
+        max_route_attempts: int = _DEFAULT_MAX_ROUTE_ATTEMPTS,
         service_name: str = "gemini-gateway",
         environment: str = "development",
     ) -> None:
@@ -64,15 +77,16 @@ class CompletionService:
         self._openrouter_api_key = _normalize_optional_secret(openrouter_api_key)
         self._openrouter_embeddings_fallback_enabled = openrouter_embeddings_fallback_enabled
         self._openrouter_embeddings_fallback_model = openrouter_embeddings_fallback_model
+        self._max_route_attempts = max(1, int(max_route_attempts))
         self._service_name = service_name
         self._environment = environment
 
     async def complete(self, request: GatewayChatRequest | dict[str, Any]) -> GatewayChatResponse:
         gateway_request = _ensure_request(request)
-        return await self._execute_with_route(
+        return await self._execute_with_route_retries(
             request=gateway_request,
-            provider_call=lambda lease: self._gemini_client.complete(
-                request=gateway_request,
+            provider_call=lambda attempt_request, lease: self._gemini_client.complete(
+                request=attempt_request,
                 api_key=lease.api_key,
                 proxy_url=lease.proxy_url,
             ),
@@ -86,10 +100,10 @@ class CompletionService:
                 retryable=True,
                 request_id=gateway_request.request_id,
             )
-        return await self._execute_with_route(
+        return await self._execute_with_route_retries(
             request=gateway_request,
-            provider_call=lambda lease: self._tts_client.synthesize(
-                request=gateway_request,
+            provider_call=lambda attempt_request, lease: self._tts_client.synthesize(
+                request=attempt_request,
                 api_key=lease.api_key,
                 proxy_url=lease.proxy_url,
             ),
@@ -104,9 +118,9 @@ class CompletionService:
                 request_id=gateway_request.request_id,
             )
         try:
-            return await self._execute_with_route(
+            return await self._execute_with_route_retries(
                 request=gateway_request,
-                provider_call=lambda lease: self._embed_with_gemini_route(gateway_request, lease),
+                provider_call=lambda attempt_request, lease: self._embed_with_gemini_route(attempt_request, lease),
             )
         except GatewayError as error:
             if not self._should_use_openrouter_embedding_fallback(request=gateway_request, error=error):
@@ -141,10 +155,8 @@ class CompletionService:
             and self._openrouter_embedding_client is not None
             and self._openrouter_api_key is not None
             and request.model == self._openrouter_embeddings_fallback_model
+            and error.retryable
             and error.reason in _OPENROUTER_EMBEDDING_FALLBACK_REASONS
-            and error.error_code != ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
-            and not bool(getattr(error, "provider_called", False))
-            and not _gateway_error_has_route_metadata(error)
         )
 
     async def _execute_openrouter_embedding_fallback(
@@ -185,6 +197,32 @@ class CompletionService:
             _attach_direct_error_route_metadata(error)
             self._log_openrouter_embedding_fallback_failure(request, error, latency_ms)
             raise error from exc
+
+    async def _execute_with_route_retries(
+        self,
+        *,
+        request: GatewayRouteRequest,
+        provider_call: Callable[[GatewayRouteRequest, RouteLease], Awaitable[ResponseT]],
+    ) -> ResponseT:
+        last_error: GatewayError | None = None
+
+        for attempt in range(self._max_route_attempts):
+            attempt_request = _request_with_retry_count(request, attempt)
+            try:
+                return await self._execute_with_route(
+                    request=attempt_request,
+                    provider_call=lambda lease, attempt_request=attempt_request: provider_call(attempt_request, lease),
+                )
+            except GatewayError as error:
+                last_error = error
+                if not _should_retry_with_next_route(error):
+                    raise
+                if attempt + 1 >= self._max_route_attempts:
+                    raise
+
+        if last_error is not None:
+            raise last_error
+        raise GatewayError(reason="request_failed", retryable=True, request_id=request.request_id)
 
     async def _execute_with_route(
         self,
@@ -361,6 +399,22 @@ def _ensure_embedding_request(request: GatewayEmbeddingRequest | dict[str, Any])
     if hasattr(GatewayEmbeddingRequest, "model_validate"):
         return GatewayEmbeddingRequest.model_validate(request)
     return GatewayEmbeddingRequest(**request)
+
+
+def _request_with_retry_count(request: GatewayRouteRequest, retry_count: int) -> GatewayRouteRequest:
+    if getattr(request, "retry_count", 0) == retry_count:
+        return request
+    if hasattr(request, "model_copy"):
+        return request.model_copy(update={"retry_count": retry_count})
+    return request.copy(update={"retry_count": retry_count})
+
+
+def _should_retry_with_next_route(error: GatewayError) -> bool:
+    if not error.retryable:
+        return False
+    if error.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE:
+        return False
+    return _gateway_error_has_route_metadata(error)
 
 
 def _attach_route_metadata(response: ResponseT, lease: RouteLease) -> ResponseT:

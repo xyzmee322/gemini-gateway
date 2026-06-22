@@ -37,6 +37,7 @@ class GeminiGatewaySettings(BaseSettings):
     internal_auth_token: SecretStr = Field(min_length=16)
     upstream_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     default_request_timeout_seconds: float = Field(default=35.0, ge=1.0, le=180.0)
+    max_route_attempts: int = Field(default=5, ge=1, le=20)
     cooldown_jitter_percent: int = Field(default=15, ge=0, le=50)
     route_attempts_ttl_days: int = Field(default=30, ge=1, le=365)
     retention_interval_seconds: float = Field(default=3600.0, ge=1.0, le=86_400.0)

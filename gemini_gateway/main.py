@@ -67,6 +67,7 @@ def build_app():
         openrouter_api_key=openrouter_api_key,
         openrouter_embeddings_fallback_enabled=settings.openrouter_embeddings_fallback_enabled,
         openrouter_embeddings_fallback_model=settings.openrouter_embeddings_fallback_model,
+        max_route_attempts=settings.max_route_attempts,
         service_name=settings.service_name,
         environment=settings.environment,
     )

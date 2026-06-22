@@ -48,14 +48,15 @@ Fallback выключен по умолчанию, чтобы случайно �
 ```powershell
 $env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED="true"
 $env:GEMINI_GATEWAY_OPENROUTER_API_KEY="sk-or-..."
+$env:GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS="5"
 ```
 
 Условия срабатывания:
 
-- сначала gateway пытается выдать обычный Gemini route `api_key + proxy`;
-- OpenRouter вызывается только если route pool не может выдать ни одного Gemini route для `google/gemini-embedding-2`;
-- разрешённые причины: `no_route`, `cooldown_active`, `quota_exhausted`;
-- fallback не срабатывает после ошибки одного уже выбранного Gemini route, потому что это не доказывает недоступность всех ключей;
+- сначала gateway пытается выполнить запрос через Gemini routes `api_key + proxy`;
+- при retryable provider/transport ошибках gateway берёт следующий route до `GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS`;
+- OpenRouter вызывается для embeddings только после route acquisition failure или исчерпания Gemini routes для `google/gemini-embedding-2`;
+- разрешённые причины включают `no_route`, `cooldown_active`, `quota_exhausted`, `network_timeout`, `proxy_failed`, `rate_limited`, `provider_unavailable`;
 - chat completions и TTS никогда не используют OpenRouter fallback.
 
 В ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-fallback`, `route_label: openrouter-embedding-fallback`.

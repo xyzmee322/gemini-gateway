@@ -743,6 +743,151 @@ async def test_completion_service_uses_selected_route_proxy_and_logs_safe_wide_e
 
 
 @pytest.mark.asyncio
+async def test_completion_service_retries_retryable_chat_failure_on_next_route() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def complete(
+            self,
+            request: GatewayChatRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayChatResponse:
+            self.calls.append(
+                {
+                    "retry_count": request.retry_count,
+                    "api_key": api_key,
+                    "proxy_url": proxy_url,
+                }
+            )
+            if len(self.calls) == 1:
+                raise GatewayError(
+                    reason="network_timeout",
+                    retryable=True,
+                    request_id=request.request_id,
+                    provider_called=True,
+                )
+            return GatewayChatResponse(
+                request_id=request.request_id,
+                generation_id="gen-chat-retry",
+                model=request.model,
+                choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            )
+
+    first_route = _candidate("chat-first", api_key="AIza-first", proxy_url="http://127.0.0.1:8001")
+    second_route = _candidate("chat-second", api_key="AIza-second", proxy_url="http://127.0.0.1:8002")
+    repository = InMemoryRouteRepository([first_route, second_route])
+    client = _Client()
+    service = CompletionService(repository=repository, gemini_client=client, environment="test")
+
+    response = await service.complete(
+        GatewayChatRequest(
+            request_id="req-chat-route-retry",
+            source_service="test",
+            model="gemini-3.5-flash",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    )
+
+    assert [call["retry_count"] for call in client.calls] == [0, 1]
+    assert client.calls[0]["api_key"] == "AIza-first"
+    assert client.calls[1]["api_key"] == "AIza-second"
+    assert response.route_label == "route-chat-second"
+    assert repository.failures[-1]["reason"] == "network_timeout"
+    assert repository.successes[-1]["binding_id"] == "chat-second"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_retry_non_retryable_chat_error() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def complete(
+            self,
+            request: GatewayChatRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayChatResponse:
+            del api_key, proxy_url
+            self.calls.append(request.retry_count)
+            raise GatewayError(
+                reason="content_filtered",
+                retryable=False,
+                request_id=request.request_id,
+                provider_called=True,
+            )
+
+    repository = InMemoryRouteRepository([_candidate("chat-filtered"), _candidate("chat-unused")])
+    client = _Client()
+    service = CompletionService(repository=repository, gemini_client=client, environment="test")
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(
+            GatewayChatRequest(
+                request_id="req-chat-no-retry",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+    assert exc_info.value.reason == "content_filtered"
+    assert client.calls == [0]
+    assert repository.failures[-1]["binding_id"] == "chat-filtered"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_stops_retryable_chat_failures_at_max_attempts() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        async def complete(
+            self,
+            request: GatewayChatRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayChatResponse:
+            del api_key, proxy_url
+            self.calls.append(request.retry_count)
+            raise GatewayError(
+                reason="network_timeout",
+                retryable=True,
+                request_id=request.request_id,
+                provider_called=True,
+            )
+
+    repository = InMemoryRouteRepository(
+        [_candidate("chat-one"), _candidate("chat-two"), _candidate("chat-three")]
+    )
+    client = _Client()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=client,
+        environment="test",
+        max_route_attempts=2,
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(
+            GatewayChatRequest(
+                request_id="req-chat-max-route-attempts",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+    assert exc_info.value.reason == "network_timeout"
+    assert exc_info.value.route_label == "route-chat-two"
+    assert client.calls == [0, 1]
+    assert [failure["binding_id"] for failure in repository.failures] == ["chat-one", "chat-two"]
+
+
+@pytest.mark.asyncio
 async def test_completion_service_routes_tts_through_same_quota_repository() -> None:
     captured: dict[str, Any] = {}
 
@@ -788,6 +933,67 @@ async def test_completion_service_routes_tts_through_same_quota_repository() -> 
 
 
 @pytest.mark.asyncio
+async def test_completion_service_retries_retryable_tts_failure_on_next_route() -> None:
+    class _TTSClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def synthesize(
+            self,
+            request: GatewayTTSRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayTTSResponse:
+            self.calls.append(
+                {
+                    "retry_count": request.retry_count,
+                    "api_key": api_key,
+                    "proxy_url": proxy_url,
+                }
+            )
+            if len(self.calls) == 1:
+                raise GatewayError(
+                    reason="provider_unavailable",
+                    retryable=True,
+                    request_id=request.request_id,
+                    provider_called=True,
+                )
+            return GatewayTTSResponse(
+                request_id=request.request_id,
+                generation_id="tts-retry",
+                model=request.model,
+                audio_base64="UklGRg==",
+                audio_mime_type="audio/wav",
+                usage={"prompt_tokens": 7, "total_tokens": 7},
+            )
+
+    tts_model = "google/gemini-3.1-flash-tts-preview"
+    first_route = _candidate("tts-first", api_key="AIza-tts-first")
+    second_route = _candidate("tts-second", api_key="AIza-tts-second")
+    first_route.model = tts_model
+    second_route.model = tts_model
+    repository = InMemoryRouteRepository([first_route, second_route])
+    client = _TTSClient()
+    service = CompletionService(repository=repository, gemini_client=object(), tts_client=client)
+
+    response = await service.synthesize_speech(
+        GatewayTTSRequest(
+            request_id="req-tts-route-retry",
+            source_service="voice_tts",
+            model=tts_model,
+            text="коротко",
+        )
+    )
+
+    assert [call["retry_count"] for call in client.calls] == [0, 1]
+    assert client.calls[0]["api_key"] == "AIza-tts-first"
+    assert client.calls[1]["api_key"] == "AIza-tts-second"
+    assert response.route_label == "route-tts-second"
+    assert repository.failures[-1]["reason"] == "provider_unavailable"
+    assert repository.successes[-1]["binding_id"] == "tts-second"
+
+
+@pytest.mark.asyncio
 async def test_completion_service_records_failure_applies_cooldown_and_logs_safe_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -821,7 +1027,12 @@ async def test_completion_service_records_failure_applies_cooldown_and_logs_safe
     repository = InMemoryRouteRepository(
         [_candidate("a", api_key="AIza-super-secret", proxy_url="http://user:pass@127.0.0.1:8000")]
     )
-    service = CompletionService(repository=repository, gemini_client=_Client(), environment="test")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=_Client(),
+        environment="test",
+        max_route_attempts=1,
+    )
     caplog.set_level(logging.WARNING, logger="gemini_gateway.service")
 
     with pytest.raises(GatewayError) as exc_info:
@@ -915,7 +1126,12 @@ async def test_completion_service_wraps_unexpected_provider_exception_with_route
     repository = InMemoryRouteRepository(
         [_candidate("a", api_key="AIza-super-secret", proxy_url="http://user:pass@127.0.0.1:8000")]
     )
-    service = CompletionService(repository=repository, gemini_client=_Client(), environment="test")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=_Client(),
+        environment="test",
+        max_route_attempts=1,
+    )
 
     with pytest.raises(GatewayError) as exc_info:
         await service.complete(
@@ -1234,104 +1450,122 @@ async def test_completion_service_does_not_use_openrouter_embedding_fallback_for
 
 
 @pytest.mark.asyncio
-async def test_completion_service_does_not_use_openrouter_embedding_fallback_after_leased_route_failure() -> None:
+async def test_completion_service_uses_openrouter_embedding_fallback_after_gemini_routes_exhausted() -> None:
     class _FailingGeminiEmbeddingClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
         async def embed(
             self,
             request: GatewayEmbeddingRequest,
             api_key: str,
             proxy_url: str,
         ) -> GatewayEmbeddingResponse:
+            self.calls.append(
+                {
+                    "retry_count": request.retry_count,
+                    "api_key": api_key,
+                    "proxy_url": proxy_url,
+                }
+            )
             raise GatewayError(
-                reason="quota_exhausted",
+                reason="network_timeout",
                 retryable=True,
                 request_id=request.request_id,
-                provider_status_code=429,
-                provider_message_safe=f"quota exhausted for {api_key} via {proxy_url}",
+                provider_called=True,
             )
 
-    route = _candidate(
-        "emb-leased",
-        api_key="AIza-emb-secret",
-        proxy_url="http://user:pass@127.0.0.1:9000",
+    first_route = _candidate(
+        "emb-first",
+        api_key="AIza-emb-first",
+        proxy_url="http://127.0.0.1:9101",
     )
-    route.model = _OPENROUTER_EMBEDDING_MODEL
-    repository = InMemoryRouteRepository([route])
+    second_route = _candidate(
+        "emb-second",
+        api_key="AIza-emb-second",
+        proxy_url="http://127.0.0.1:9102",
+    )
+    first_route.model = _OPENROUTER_EMBEDDING_MODEL
+    second_route.model = _OPENROUTER_EMBEDDING_MODEL
+    repository = InMemoryRouteRepository([first_route, second_route])
+    gemini_client = _FailingGeminiEmbeddingClient()
     openrouter_client = _RecordingOpenRouterEmbeddingClient()
     service = CompletionService(
         repository=repository,
         gemini_client=object(),
-        embedding_client=_FailingGeminiEmbeddingClient(),
+        embedding_client=gemini_client,
         openrouter_embedding_client=openrouter_client,
         openrouter_api_key=_OPENROUTER_API_KEY,
         openrouter_embeddings_fallback_enabled=True,
         environment="test",
     )
+    request = _embedding_request(request_id="req-gemini-exhausted-openrouter")
 
-    with pytest.raises(GatewayError) as exc_info:
-        await service.embed(_embedding_request(request_id="req-leased-gemini-failure"))
+    response = await service.embed(request)
 
-    error = exc_info.value
-    assert error.reason == "quota_exhausted"
-    assert error.route_label == "route-emb-leased"
-    assert error.project_label == "friend-emb-leased"
-    assert error.key_label == "key-emb-leased"
-    assert error.proxy_label == "proxy-emb-leased"
-    assert error.transport_mode == "proxy"
-    assert openrouter_client.calls == []
-    assert repository.failures[-1]["provider_called"] is True
+    assert [call["retry_count"] for call in gemini_client.calls] == [0, 1]
+    assert gemini_client.calls[0]["api_key"] == "AIza-emb-first"
+    assert gemini_client.calls[1]["api_key"] == "AIza-emb-second"
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert [failure["binding_id"] for failure in repository.failures[:2]] == ["emb-first", "emb-second"]
+    assert repository.failures[-1]["binding_id"] is None
+    assert repository.failures[-1]["reason"] == "no_route"
+    assert response.route_label == "openrouter-embedding-fallback"
+    assert response.transport_mode == "direct"
 
 
 @pytest.mark.asyncio
-async def test_completion_service_does_not_use_openrouter_embedding_fallback_after_request_group_routes_exhausted() -> None:
-    class _FailingGeminiEmbeddingClient:
-        async def embed(
-            self,
-            request: GatewayEmbeddingRequest,
-            api_key: str,
-            proxy_url: str,
-        ) -> GatewayEmbeddingResponse:
-            del api_key, proxy_url
+async def test_completion_service_uses_openrouter_embedding_fallback_after_attempted_routes_exhausted() -> None:
+    class _AttemptedRoutesExhaustedRepository:
+        def __init__(self) -> None:
+            self.failures: list[dict[str, Any]] = []
+
+        async def acquire_route(self, request: GatewayEmbeddingRequest) -> None:
             raise GatewayError(
-                reason="proxy_failed",
+                reason="no_route",
                 retryable=True,
                 request_id=request.request_id,
-                provider_called=False,
+                error_code=ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
             )
 
-    route = _candidate("emb-request-group")
-    route.model = _OPENROUTER_EMBEDDING_MODEL
-    repository = InMemoryRouteRepository([route])
+        async def record_success(self, lease: Any, response: Any, latency_ms: int) -> None:
+            del lease, response, latency_ms
+
+        async def record_failure(
+            self,
+            lease: Any,
+            error: GatewayError,
+            latency_ms: int,
+            provider_called: bool,
+        ) -> None:
+            self.failures.append(
+                {
+                    "lease": lease,
+                    "error": error,
+                    "latency_ms": latency_ms,
+                    "provider_called": provider_called,
+                }
+            )
+
+    repository = _AttemptedRoutesExhaustedRepository()
     openrouter_client = _RecordingOpenRouterEmbeddingClient()
     service = CompletionService(
         repository=repository,
         gemini_client=object(),
-        embedding_client=_FailingGeminiEmbeddingClient(),
+        embedding_client=_RecordingGeminiEmbeddingClient(),
         openrouter_embedding_client=openrouter_client,
         openrouter_api_key=_OPENROUTER_API_KEY,
         openrouter_embeddings_fallback_enabled=True,
         environment="test",
     )
+    request = _embedding_request(request_id="req-attempted-routes-openrouter")
 
-    first_request = _embedding_request(request_id="req-group-first")
-    first_request.soybob_request_id = "embedding-request-group"
-    second_request = _embedding_request(request_id="req-group-second")
-    second_request.soybob_request_id = "embedding-request-group"
-    second_request.retry_count = 1
+    response = await service.embed(request)
 
-    with pytest.raises(GatewayError) as first_exc_info:
-        await service.embed(first_request)
-
-    assert first_exc_info.value.reason == "proxy_failed"
-    assert first_exc_info.value.route_label == "route-emb-request-group"
-
-    with pytest.raises(GatewayError) as second_exc_info:
-        await service.embed(second_request)
-
-    assert second_exc_info.value.reason == "no_route"
-    assert second_exc_info.value.error_code == "attempted_routes_exhausted"
-    assert second_exc_info.value.route_label is None
-    assert openrouter_client.calls == []
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert repository.failures[0]["lease"] is None
+    assert repository.failures[0]["error"].error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
+    assert response.route_label == "openrouter-embedding-fallback"
 
 
 @pytest.mark.asyncio

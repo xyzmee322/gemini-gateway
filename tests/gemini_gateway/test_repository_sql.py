@@ -82,6 +82,50 @@ class _HealthSessionFactory:
         return self.session
 
 
+class _DiagnosticRows:
+    def mappings(self) -> "_DiagnosticRows":
+        return self
+
+    def one(self) -> dict[str, Any]:
+        return {
+            "eligible_routes_count": 0,
+            "exhausted_routes_count": 0,
+            "cooldown_routes_count": 0,
+            "disabled_routes_count": 0,
+            "reservable_routes_count": 0,
+            "blocking_reason": None,
+            "retry_after_at": None,
+            "quota_reset_at": None,
+            "sleep_until": None,
+            "cooldown_level": None,
+        }
+
+
+class _DiagnosticSession:
+    def __init__(self) -> None:
+        self.sql: str | None = None
+        self.params: dict[str, Any] | None = None
+
+    async def __aenter__(self) -> "_DiagnosticSession":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def execute(self, statement: object, params: dict[str, Any] | None = None) -> _DiagnosticRows:
+        self.sql = _normalize_sql(str(statement))
+        self.params = params or {}
+        return _DiagnosticRows()
+
+
+class _DiagnosticSessionFactory:
+    def __init__(self) -> None:
+        self.session = _DiagnosticSession()
+
+    def __call__(self) -> _DiagnosticSession:
+        return self.session
+
+
 class _SeedKeySession:
     def __init__(self) -> None:
         self.scalar_calls: list[tuple[str, dict[str, Any]]] = []
@@ -143,6 +187,33 @@ async def test_health_check_schema_requires_cooldowns_table() -> None:
     schema_sql, _ = session_factory.session.scalar_calls[0]
     assert "'cooldowns'" in schema_sql
     assert health["checks"]["schema"] is False
+
+
+@pytest.mark.asyncio
+async def test_route_unavailability_diagnostics_excludes_attempted_bindings_from_sql() -> None:
+    session_factory = _DiagnosticSessionFactory()
+    repository = PostgresGatewayRepository(
+        session_factory=session_factory,  # type: ignore[arg-type]
+        secret_vault=_secret_vault(),
+    )
+    now = datetime(2026, 6, 22, tzinfo=UTC)
+
+    diagnostics = await repository._route_unavailability_diagnostics(
+        model="google/gemini-3.5-flash",
+        estimated_tokens=100,
+        now=now,
+        excluded_binding_ids={"7", "3"},
+    )
+
+    assert diagnostics.reason == "no_route"
+    assert session_factory.session.sql is not None
+    assert session_factory.session.sql.count("b.id::text != ALL(CAST(:excluded_binding_ids AS text[]))") == 2
+    assert session_factory.session.params == {
+        "model": "google/gemini-3.5-flash",
+        "estimated_tokens": 100,
+        "now": now,
+        "excluded_binding_ids": ["3", "7"],
+    }
 
 
 @pytest.mark.asyncio

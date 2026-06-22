@@ -393,9 +393,7 @@ class PostgresGatewayRepository:
                 return lease
             candidates = [item for item in candidates if item.binding_id != candidate.binding_id]
 
-        if attempted_routes_excluded and not candidates:
-            diagnostics = _RouteAcquisitionDiagnostics(reason="no_route")
-        elif candidates:
+        if candidates:
             diagnostics = _route_unavailability_from_candidates(
                 candidates=candidates,
                 disabled_routes_count=0,
@@ -407,6 +405,7 @@ class PostgresGatewayRepository:
                 model=request.model,
                 estimated_tokens=estimated_tokens,
                 now=now,
+                excluded_binding_ids=attempted_binding_ids,
             )
         if prior_model_route_attempted:
             diagnostics = _with_route_acquisition_error_code(
@@ -426,9 +425,15 @@ class PostgresGatewayRepository:
         model: str,
         estimated_tokens: int,
         now: datetime,
+        excluded_binding_ids: set[str] | None = None,
     ) -> _RouteAcquisitionDiagnostics:
+        excluded_binding_filter = (
+            "\n                  AND b.id::text != ALL(CAST(:excluded_binding_ids AS text[]))"
+            if excluded_binding_ids
+            else ""
+        )
         query = text(
-            """
+            f"""
             WITH all_model_routes AS (
                 SELECT
                     b.id AS binding_id,
@@ -447,6 +452,7 @@ class PostgresGatewayRepository:
                 JOIN gemini_gateway.google_projects p ON p.id = k.project_id
                 LEFT JOIN gemini_gateway.model_limits ml ON ml.project_id = p.id AND ml.model = :model
                 WHERE ml.model = :model
+                {excluded_binding_filter}
             ),
             route_base AS (
                 SELECT
@@ -510,6 +516,7 @@ class PostgresGatewayRepository:
                   AND px.status = 'active'
                   AND ml.status = 'active'
                   AND b.transport_mode = 'proxy'
+                  {excluded_binding_filter}
             ),
             route_blocks AS (
                 SELECT
@@ -719,11 +726,14 @@ class PostgresGatewayRepository:
                 (SELECT cooldown_level FROM next_unblock) AS cooldown_level
             """
         )
+        params: dict[str, Any] = {"model": model, "estimated_tokens": estimated_tokens, "now": now}
+        if excluded_binding_ids:
+            params["excluded_binding_ids"] = sorted(excluded_binding_ids)
         async with self._session_factory() as session:
             row = (
                 await session.execute(
                     query,
-                    {"model": model, "estimated_tokens": estimated_tokens, "now": now},
+                    params,
                 )
             ).mappings().one()
         return _route_unavailability_from_diagnostic_row(row, now=now)

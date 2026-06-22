@@ -23,7 +23,9 @@ from gemini_gateway.gemini_client import GeminiOpenAIClient
 from gemini_gateway.repository import (
     ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE,
     InMemoryRouteRepository,
+    PostgresGatewayRepository,
     RouteScorer,
+    _RouteAcquisitionDiagnostics,
 )
 from gemini_gateway.repository import _safe_provider_response_json
 from gemini_gateway.service import CompletionService
@@ -424,6 +426,124 @@ async def test_repository_does_not_reuse_route_inside_same_soybob_request() -> N
     assert [lease.binding_id for lease in leases] == ["a", "b", "c"]
     assert exc_info.value.reason == "no_route"
     assert exc_info.value.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
+
+
+@pytest.mark.asyncio
+async def test_repository_preserves_remaining_route_diagnostics_after_attempted_exclusion() -> None:
+    repository = InMemoryRouteRepository([_candidate("attempted"), _candidate("daily-quota", day_requests_used=100)])
+    await repository.acquire_route(
+        GatewayChatRequest(
+            request_id="req-attempted-first",
+            soybob_request_id="req-mixed-diagnostics",
+            source_service="test",
+            model="gemini-3.5-flash",
+            messages=[{"role": "user", "content": "hello"}],
+            estimated_input_tokens=100,
+        )
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await repository.acquire_route(
+            GatewayChatRequest(
+                request_id="req-attempted-second",
+                soybob_request_id="req-mixed-diagnostics",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hello"}],
+                estimated_input_tokens=100,
+                retry_count=1,
+            )
+        )
+
+    error = exc_info.value
+    assert error.reason == "quota_exhausted"
+    assert error.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
+    assert error.quota_scope == "day"
+    assert error.eligible_routes_count == 1
+    assert error.exhausted_routes_count == 1
+
+
+class _DiagnosticsPostgresRepository(PostgresGatewayRepository):
+    def __init__(self) -> None:
+        self.diagnostics_calls: list[dict[str, Any]] = []
+        self.skipped: list[dict[str, Any]] = []
+
+    async def list_route_candidates(self, model: str, now: datetime) -> list[RouteCandidate]:
+        del model, now
+        return [_candidate("attempted")]
+
+    async def _attempted_binding_ids(self, *, request: GatewayChatRequest) -> set[str]:
+        del request
+        return {"attempted"}
+
+    async def _route_unavailability_diagnostics(
+        self,
+        *,
+        model: str,
+        estimated_tokens: int,
+        now: datetime,
+        excluded_binding_ids: set[str] | None = None,
+    ) -> _RouteAcquisitionDiagnostics:
+        self.diagnostics_calls.append(
+            {
+                "model": model,
+                "estimated_tokens": estimated_tokens,
+                "excluded_binding_ids": excluded_binding_ids,
+                "now": now,
+            }
+        )
+        return _RouteAcquisitionDiagnostics(
+            reason="quota_exhausted",
+            error_code="quota_exhausted",
+            retry_after_seconds=300,
+            quota_scope="day",
+            quota_reset_at="2026-06-22T00:00:00+00:00",
+            eligible_routes_count=1,
+            exhausted_routes_count=1,
+            disabled_routes_count=0,
+        )
+
+    async def _record_skipped_route_unavailable(
+        self,
+        *,
+        request: GatewayChatRequest,
+        estimated_tokens: int,
+        reason: str,
+    ) -> None:
+        self.skipped.append({"request_id": request.request_id, "estimated_tokens": estimated_tokens, "reason": reason})
+
+
+@pytest.mark.asyncio
+async def test_postgres_repository_preserves_diagnostics_after_attempted_exclusion() -> None:
+    repository = _DiagnosticsPostgresRepository()
+
+    with pytest.raises(GatewayError) as exc_info:
+        await repository.acquire_route(
+            GatewayChatRequest(
+                request_id="req-postgres-attempted",
+                soybob_request_id="req-postgres-attempted-group",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hello"}],
+                estimated_input_tokens=100,
+                retry_count=1,
+            )
+        )
+
+    error = exc_info.value
+    assert error.reason == "quota_exhausted"
+    assert error.error_code == ATTEMPTED_ROUTES_EXHAUSTED_ERROR_CODE
+    assert error.quota_scope == "day"
+    assert error.eligible_routes_count == 1
+    assert error.exhausted_routes_count == 1
+    assert repository.diagnostics_calls[0]["excluded_binding_ids"] == {"attempted"}
+    assert repository.skipped == [
+        {
+            "request_id": "req-postgres-attempted",
+            "estimated_tokens": 100,
+            "reason": "quota_exhausted",
+        }
+    ]
 
 
 @pytest.mark.asyncio

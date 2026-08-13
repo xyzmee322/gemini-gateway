@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -80,6 +81,21 @@ bindings:
     config = load_seed_config(seed_path)
 
     assert config.api_keys[0].api_key == "AIza-expanded-from-env"
+
+
+def test_dev_seed_registers_gemini_3_7_with_3_6_limits(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-test")
+    monkeypatch.setenv("GEMINI_GATEWAY_PROXY_URL", "http://proxy.test:8080")
+
+    config = load_seed_config(Path("config/gemini-gateway-seed.dev.yaml"))
+    limits_by_model = {limit.model: limit for limit in config.projects[0].model_limits}
+
+    source = limits_by_model["google/gemini-3.6-flash"]
+    target = limits_by_model["google/gemini-3.7-flash"]
+    assert target.requests_per_minute == source.requests_per_minute
+    assert target.tokens_per_minute == source.tokens_per_minute
+    assert target.requests_per_day == source.requests_per_day
+    assert target.tokens_per_day == source.tokens_per_day
 
 
 def test_load_seed_config_rejects_missing_environment_variable(tmp_path) -> None:

@@ -331,7 +331,11 @@ async def test_client_normalizes_multimodal_tool_result_for_gemini_openai_payloa
                     "tool_call_id": "call-photo",
                     "content": [
                         {"type": "text", "text": '{"status":"success","images_count":2}'},
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,abc"},
+                            "media_resolution": "medium",
+                        },
                         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,def"}},
                     ],
                 },
@@ -362,6 +366,7 @@ async def test_client_normalizes_multimodal_tool_result_for_gemini_openai_payloa
     }
     assert image_followup["role"] == "user"
     assert [part["type"] for part in image_followup["content"]] == ["text", "image_url", "image_url"]
+    assert image_followup["content"][1]["media_resolution"] == "medium"
     assert "data:image" not in tool_message["content"]
 
 

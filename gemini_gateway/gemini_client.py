@@ -621,7 +621,11 @@ def _tool_image_parts(content: list[Any]) -> list[dict[str, Any]]:
         image_url = part.get("image_url")
         if not isinstance(image_url, dict) or image_url.get("url") is None:
             continue
-        image_parts.append({"type": "image_url", "image_url": {"url": str(image_url["url"])}})
+        normalized_part = {"type": "image_url", "image_url": {"url": str(image_url["url"])}}
+        media_resolution = part.get("media_resolution")
+        if media_resolution in {"low", "medium", "high", "ultra_high"}:
+            normalized_part["media_resolution"] = media_resolution
+        image_parts.append(normalized_part)
     return image_parts
 
 

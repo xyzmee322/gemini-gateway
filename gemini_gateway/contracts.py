@@ -35,6 +35,15 @@ def _reject_direct_transport_mode(value: Any, *, message: str) -> Any:
     return value
 
 
+def _data_url_mime_type(url: str) -> str | None:
+    normalized_url = url.strip()
+    if not normalized_url.lower().startswith("data:"):
+        return None
+    metadata = normalized_url[5:].split(",", maxsplit=1)[0]
+    mime_type = metadata.split(";", maxsplit=1)[0].strip().lower()
+    return mime_type or "image/jpeg"
+
+
 def sanitize_gateway_provider_specific_fields(payload: Any) -> dict[str, Any]:
     """Оставляет только metadata, нужную для reasoning/tool continuity."""
 
@@ -122,9 +131,34 @@ class GatewayEmbeddingInputPart(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["text", "image_url"]
+    type: Literal["text", "image_url", "inline_data"]
     text: str | None = None
     image_url: dict[str, Any] | None = None
+    inline_data: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_inline_data_payload(cls, value: Any) -> Any:
+        """Нормализует alias mimeType во внутренний mime_type."""
+
+        if not isinstance(value, dict) or value.get("type") != "inline_data":
+            return value
+        inline_data = value.get("inline_data")
+        if not isinstance(inline_data, dict):
+            return value
+
+        normalized_inline_data = {
+            key: item
+            for key, item in inline_data.items()
+            if key not in {"mimeType", "mime_type", "data"}
+        }
+        mime_type = inline_data.get("mime_type", inline_data.get("mimeType"))
+        data = inline_data.get("data")
+        if mime_type is not None:
+            normalized_inline_data["mime_type"] = str(mime_type).strip()
+        if data is not None:
+            normalized_inline_data["data"] = str(data).strip()
+        return {**value, "inline_data": normalized_inline_data}
 
     @model_validator(mode="after")
     def validate_payload_for_type(self) -> "GatewayEmbeddingInputPart":
@@ -132,15 +166,28 @@ class GatewayEmbeddingInputPart(BaseModel):
             if self.text is None or not self.text.strip():
                 raise ValueError("text embedding part requires text")
             return self
-        image_url = self.image_url if isinstance(self.image_url, dict) else {}
-        url = image_url.get("url")
-        if url is None or not str(url).strip():
-            raise ValueError("image_url embedding part requires image_url.url")
+        if self.type == "image_url":
+            image_url = self.image_url if isinstance(self.image_url, dict) else {}
+            url = image_url.get("url")
+            if url is None or not str(url).strip():
+                raise ValueError("image_url embedding part requires image_url.url")
+            mime_type = _data_url_mime_type(str(url))
+            if mime_type is not None and not mime_type.startswith("image/"):
+                raise ValueError("image_url embedding part requires image/* data URL")
+            return self
+
+        inline_data = self.inline_data if isinstance(self.inline_data, dict) else {}
+        mime_type = inline_data.get("mime_type")
+        data = inline_data.get("data")
+        if mime_type is None or not str(mime_type).strip():
+            raise ValueError("inline_data embedding part requires inline_data.mime_type")
+        if data is None or not str(data).strip():
+            raise ValueError("inline_data embedding part requires inline_data.data")
         return self
 
 
 class GatewayEmbeddingRequest(GatewayRouteRequest):
-    """Native Gemini embedding запрос с общим route lease."""
+    """Мультимодальный embedding-запрос без привязки к конкретному провайдеру."""
 
     input: list[GatewayEmbeddingInputPart] = Field(min_length=1, max_length=8)
     dimensions: int = Field(default=1536)

@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-from gemini_gateway.contracts import GatewayEmbeddingRequest
+from gemini_gateway.contracts import GatewayEmbeddingInputPart, GatewayEmbeddingRequest
 from gemini_gateway.embedding_client import GeminiEmbeddingClient
 from gemini_gateway.errors import GatewayError
 
@@ -44,6 +44,51 @@ async def test_embedding_client_requires_proxy_url_without_provider_call() -> No
     assert exc_info.value.reason == "no_route"
     assert exc_info.value.retryable is True
     assert exc_info.value.provider_called is False
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_allows_inline_data_without_proxy() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content)
+        seen["timeout"] = request.extensions["timeout"]
+        return httpx.Response(
+            200,
+            json={
+                "embedding": {"values": _embedding_values()},
+                "usageMetadata": {"totalTokenCount": 7},
+            },
+        )
+
+    client = GeminiEmbeddingClient(base_url="https://example.test/v1beta", transport=httpx.MockTransport(handler))
+
+    response = await client.embed(
+        request=GatewayEmbeddingRequest(
+            request_id="req-emb-inline-direct",
+            source_service="media_memory",
+            model="google/gemini-embedding-2",
+            input=[
+                {
+                    "type": "inline_data",
+                    "inline_data": {"mime_type": "audio/wav", "data": "UklGRg=="},
+                }
+            ],
+            dimensions=1536,
+            timeout_seconds=11,
+        ),
+        api_key="AIza-test-key",
+        proxy_url=None,
+    )
+
+    assert seen["url"] == "https://example.test/v1beta/models/gemini-embedding-2:embedContent"
+    assert seen["json"]["content"]["parts"] == [
+        {"inlineData": {"mimeType": "audio/wav", "data": "UklGRg=="}}
+    ]
+    assert seen["timeout"]["read"] == 11
+    assert response.usage == {"total_tokens": 7}
+    assert len(response.embedding) == 1536
 
 
 @pytest.mark.asyncio
@@ -102,6 +147,47 @@ async def test_embedding_client_posts_native_payload_through_proxy_and_parses_re
     assert response.provider_timing["request_bytes"] > 0
     assert response.provider_timing["response_bytes"] > 0
     assert response.provider_timing["response_headers_ms"] is not None
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_posts_inline_audio_payload() -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "embedding": {"values": _embedding_values(768)},
+                "usageMetadata": {"totalTokenCount": 8},
+            },
+        )
+
+    client = GeminiEmbeddingClient(base_url="https://example.test/v1beta", transport=httpx.MockTransport(handler))
+
+    response = await client.embed(
+        request=GatewayEmbeddingRequest(
+            request_id="req-emb-audio",
+            source_service="media_memory",
+            model="google/gemini-embedding-2",
+            input=[
+                {
+                    "type": "inline_data",
+                    "inline_data": {"mime_type": "audio/wav", "data": "UklGRg=="},
+                },
+            ],
+            dimensions=768,
+        ),
+        api_key="AIza-test-key",
+        proxy_url=_PROXY_URL,
+    )
+
+    assert seen["json"]["content"]["parts"] == [
+        {"inlineData": {"mimeType": "audio/wav", "data": "UklGRg=="}},
+    ]
+    assert seen["json"]["outputDimensionality"] == 768
+    assert len(response.embedding) == 768
+    assert response.usage["total_tokens"] == 8
 
 
 @pytest.mark.asyncio
@@ -180,6 +266,39 @@ async def test_embedding_client_rejects_unsupported_image_url_without_provider_c
             api_key="AIza-test-key",
             proxy_url=_PROXY_URL,
         )
+
+    assert called is False
+    assert exc_info.value.reason == "bad_request"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.provider_called is False
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_rejects_audio_data_url_image_url_without_provider_call() -> None:
+    called = False
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"embedding": {"values": _embedding_values()}})
+
+    client = GeminiEmbeddingClient(base_url="https://example.test/v1beta", transport=httpx.MockTransport(handler))
+    request = GatewayEmbeddingRequest.model_construct(
+        request_id="req-emb-audio-image-url",
+        source_service="media_memory",
+        model="google/gemini-embedding-2",
+        input=[
+            GatewayEmbeddingInputPart.model_construct(
+                type="image_url",
+                image_url={"url": "data:audio/wav;base64,UklGRg=="},
+            )
+        ],
+        dimensions=1536,
+        timeout_seconds=30,
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.embed(request=request, api_key="AIza-test-key", proxy_url=_PROXY_URL)
 
     assert called is False
     assert exc_info.value.reason == "bad_request"

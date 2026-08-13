@@ -47,7 +47,10 @@ _OPENROUTER_EMBEDDING_FALLBACK_REASONS = frozenset(
     }
 )
 _OPENROUTER_EMBEDDING_FALLBACK_STAGE = "openrouter_embedding_fallback"
+_OPENROUTER_EMBEDDING_DIRECT_STAGE = "openrouter_embedding_direct"
 _OPENROUTER_FALLBACK_PROVIDER = "openrouter"
+_OPENROUTER_ROUTING_MODE_FALLBACK = "fallback"
+_OPENROUTER_ROUTING_MODE_DIRECT_ONLY = "direct_only"
 _DEFAULT_MAX_ROUTE_ATTEMPTS = 5
 
 
@@ -64,6 +67,7 @@ class CompletionService:
         openrouter_embedding_client: Any | None = None,
         openrouter_api_key: str | None = None,
         openrouter_embeddings_fallback_enabled: bool = False,
+        openrouter_embeddings_direct_only_enabled: bool = False,
         openrouter_embeddings_fallback_model: str = _OPENROUTER_EMBEDDING_FALLBACK_MODEL,
         max_route_attempts: int = _DEFAULT_MAX_ROUTE_ATTEMPTS,
         service_name: str = "gemini-gateway",
@@ -76,6 +80,7 @@ class CompletionService:
         self._openrouter_embedding_client = openrouter_embedding_client
         self._openrouter_api_key = _normalize_optional_secret(openrouter_api_key)
         self._openrouter_embeddings_fallback_enabled = openrouter_embeddings_fallback_enabled
+        self._openrouter_embeddings_direct_only_enabled = openrouter_embeddings_direct_only_enabled
         self._openrouter_embeddings_fallback_model = openrouter_embeddings_fallback_model
         self._max_route_attempts = max(1, int(max_route_attempts))
         self._service_name = service_name
@@ -111,6 +116,8 @@ class CompletionService:
 
     async def embed(self, request: GatewayEmbeddingRequest | dict[str, Any]) -> GatewayEmbeddingResponse:
         gateway_request = _ensure_embedding_request(request)
+        if self._should_use_openrouter_embedding_direct_only(gateway_request):
+            return await self._execute_openrouter_embedding_direct(gateway_request)
         if self._embedding_client is None:
             raise GatewayError(
                 reason="provider_unavailable",
@@ -141,7 +148,7 @@ class CompletionService:
         return await self._embedding_client.embed(
             request=request,
             api_key=lease.api_key,
-            proxy_url=lease.proxy_url,
+            proxy_url=None if _embedding_request_has_inline_data(request) else lease.proxy_url,
         )
 
     def _should_use_openrouter_embedding_fallback(
@@ -159,43 +166,105 @@ class CompletionService:
             and error.reason in _OPENROUTER_EMBEDDING_FALLBACK_REASONS
         )
 
+    def _should_use_openrouter_embedding_direct_only(self, request: GatewayEmbeddingRequest) -> bool:
+        return (
+            self._openrouter_embeddings_direct_only_enabled
+            and request.model == self._openrouter_embeddings_fallback_model
+        )
+
+    async def _execute_openrouter_embedding_direct(
+        self,
+        request: GatewayEmbeddingRequest,
+    ) -> GatewayEmbeddingResponse:
+        return await self._execute_openrouter_embedding(
+            request=request,
+            route_metadata=_openrouter_direct_route_metadata(),
+            failed_stage=_OPENROUTER_EMBEDDING_DIRECT_STAGE,
+            routing_mode=_OPENROUTER_ROUTING_MODE_DIRECT_ONLY,
+        )
+
     async def _execute_openrouter_embedding_fallback(
         self,
         request: GatewayEmbeddingRequest,
+    ) -> GatewayEmbeddingResponse:
+        return await self._execute_openrouter_embedding(
+            request=request,
+            route_metadata=_openrouter_fallback_route_metadata(),
+            failed_stage=_OPENROUTER_EMBEDDING_FALLBACK_STAGE,
+            routing_mode=_OPENROUTER_ROUTING_MODE_FALLBACK,
+        )
+
+    async def _execute_openrouter_embedding(
+        self,
+        *,
+        request: GatewayEmbeddingRequest,
+        route_metadata: GatewayRouteMetadata,
+        failed_stage: str,
+        routing_mode: str,
     ) -> GatewayEmbeddingResponse:
         started_at = perf_counter()
         client = self._openrouter_embedding_client
         api_key = self._openrouter_api_key
         if client is None or api_key is None:
-            raise GatewayError(
+            error = GatewayError(
                 reason="provider_unavailable",
                 retryable=True,
                 request_id=request.request_id,
             )
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openrouter_embedding_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
+            raise error
 
         try:
             response = await client.embed(request=request, api_key=api_key)
-            response = _attach_direct_route_metadata(response)
+            response = _attach_response_route_metadata(response, route_metadata)
             latency_ms = _elapsed_ms(started_at)
-            self._log_openrouter_embedding_fallback_success(request, response, latency_ms)
+            self._log_openrouter_embedding_success(
+                request,
+                response,
+                latency_ms,
+                route_metadata,
+                routing_mode,
+            )
             return response
         except GatewayError as error:
             latency_ms = _elapsed_ms(started_at)
             _set_request_id(error, request.request_id)
-            _attach_direct_error_route_metadata(error)
-            self._log_openrouter_embedding_fallback_failure(request, error, latency_ms)
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openrouter_embedding_failure(
+                request,
+                error,
+                latency_ms,
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
             raise
         except Exception as exc:
             latency_ms = _elapsed_ms(started_at)
             error = GatewayError(
                 reason="request_failed",
                 retryable=True,
-                provider_message_safe=str(exc),
+                provider_message_safe="openrouter_embedding_error",
                 request_id=request.request_id,
                 status_code=500,
             )
-            _attach_direct_error_route_metadata(error)
-            self._log_openrouter_embedding_fallback_failure(request, error, latency_ms)
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openrouter_embedding_failure(
+                request,
+                error,
+                latency_ms,
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
             raise error from exc
 
     async def _execute_with_route_retries(
@@ -294,38 +363,47 @@ class CompletionService:
         event.update(_failure_log_fields(error, _gateway_failure_stage(lease=lease, provider_called=provider_called)))
         _LOGGER.warning("gemini_gateway_request", extra=event)
 
-    def _log_openrouter_embedding_fallback_success(
+    def _log_openrouter_embedding_success(
         self,
         request: GatewayEmbeddingRequest,
         response: GatewayEmbeddingResponse,
         latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+        routing_mode: str,
     ) -> None:
         event = self._base_event(
             request=request,
             lease=None,
             latency_ms=latency_ms,
             status="success",
-            route_metadata=_openrouter_fallback_route_metadata(),
+            route_metadata=route_metadata,
         )
         event.update(_success_log_fields(response))
-        event["fallback_provider"] = _OPENROUTER_FALLBACK_PROVIDER
+        event["openrouter_routing_mode"] = routing_mode
+        if routing_mode == _OPENROUTER_ROUTING_MODE_FALLBACK:
+            event["fallback_provider"] = _OPENROUTER_FALLBACK_PROVIDER
         _LOGGER.info("gemini_gateway_request", extra=event)
 
-    def _log_openrouter_embedding_fallback_failure(
+    def _log_openrouter_embedding_failure(
         self,
         request: GatewayEmbeddingRequest,
         error: GatewayError,
         latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+        failed_stage: str,
+        routing_mode: str,
     ) -> None:
         event = self._base_event(
             request=request,
             lease=None,
             latency_ms=latency_ms,
             status="error",
-            route_metadata=_openrouter_fallback_route_metadata(),
+            route_metadata=route_metadata,
         )
-        event.update(_failure_log_fields(error, _OPENROUTER_EMBEDDING_FALLBACK_STAGE))
-        event["fallback_provider"] = _OPENROUTER_FALLBACK_PROVIDER
+        event.update(_failure_log_fields(error, failed_stage))
+        event["openrouter_routing_mode"] = routing_mode
+        if routing_mode == _OPENROUTER_ROUTING_MODE_FALLBACK:
+            event["fallback_provider"] = _OPENROUTER_FALLBACK_PROVIDER
         _LOGGER.warning("gemini_gateway_request", extra=event)
 
     def _base_event(
@@ -421,10 +499,6 @@ def _attach_route_metadata(response: ResponseT, lease: RouteLease) -> ResponseT:
     return _attach_response_route_metadata(response, _route_metadata_from_lease(lease))
 
 
-def _attach_direct_route_metadata(response: ResponseT) -> ResponseT:
-    return _attach_response_route_metadata(response, _openrouter_fallback_route_metadata())
-
-
 def _attach_response_route_metadata(response: ResponseT, route_metadata: Any) -> ResponseT:
     route = _route_metadata_to_dict(route_metadata)
     updates = {
@@ -463,10 +537,6 @@ def _attach_error_route_metadata(error: GatewayError, lease: RouteLease | None) 
     _attach_error_metadata(error, _route_metadata_from_lease(lease), overwrite=False)
 
 
-def _attach_direct_error_route_metadata(error: GatewayError) -> None:
-    _attach_error_metadata(error, _openrouter_fallback_route_metadata(), overwrite=True)
-
-
 def _attach_error_metadata(error: GatewayError, route_metadata: Any, *, overwrite: bool) -> None:
     for field_name, value in _route_metadata_to_dict(route_metadata).items():
         if field_name == "route":
@@ -500,6 +570,16 @@ def _openrouter_fallback_route_metadata() -> GatewayRouteMetadata:
     )
 
 
+def _openrouter_direct_route_metadata() -> GatewayRouteMetadata:
+    return GatewayRouteMetadata(
+        project_label="openrouter-direct",
+        route_label="openrouter-embedding-direct",
+        key_label="openrouter-api-key",
+        proxy_label=None,
+        transport_mode="direct",
+    )
+
+
 def _route_metadata_to_dict(route_metadata: Any) -> dict[str, Any]:
     if isinstance(route_metadata, GatewayRouteMetadata):
         return route_metadata.model_dump(mode="python")
@@ -526,6 +606,10 @@ def _normalize_optional_secret(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _embedding_request_has_inline_data(request: GatewayEmbeddingRequest) -> bool:
+    return any(part.type == "inline_data" for part in request.input)
 
 
 def _success_log_fields(response: GatewayProviderResponse) -> dict[str, Any]:

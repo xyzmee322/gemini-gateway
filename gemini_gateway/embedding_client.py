@@ -47,12 +47,13 @@ class GeminiEmbeddingClient:
         api_key: str,
         proxy_url: str | None,
     ) -> GatewayEmbeddingResponse:
-        _require_proxy_url(proxy_url=proxy_url, request_id=request.request_id)
+        if proxy_url is None and not _request_has_inline_data(request):
+            _require_proxy_url(proxy_url=proxy_url, request_id=request.request_id)
         payload = _embedding_payload(request)
         url = f"{self._base_url}/models/{_to_gemini_model_name(request.model)}:embedContent"
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         try:
-            if self._client_pool is not None:
+            if self._client_pool is not None and proxy_url is not None:
                 result = await send_timed_json(
                     client=self._client_pool.get(proxy_url=proxy_url),
                     method="POST",
@@ -148,9 +149,20 @@ def _embedding_payload(request: GatewayEmbeddingRequest) -> dict[str, Any]:
 
 
 def _native_part(part: dict[str, Any], *, request_id: str) -> dict[str, Any]:
-    if part.get("type") == "text":
+    part_type = part.get("type")
+    if part_type == "text":
         return {"text": str(part.get("text") or "").strip()}
-    return _image_part(part.get("image_url"), request_id=request_id)
+    if part_type == "image_url":
+        return _image_part(part.get("image_url"), request_id=request_id)
+    if part_type == "inline_data":
+        return _inline_data_part(part.get("inline_data"), request_id=request_id)
+    raise GatewayError(
+        reason="bad_request",
+        retryable=False,
+        provider_message_safe="embedding part type is not supported",
+        request_id=request_id,
+        provider_called=False,
+    )
 
 
 def _image_part(image_url: Any, *, request_id: str) -> dict[str, Any]:
@@ -165,6 +177,14 @@ def _image_part(image_url: Any, *, request_id: str) -> dict[str, Any]:
     url = str(image_url.get("url") or "").strip()
     data_url = _parse_data_url(url)
     if data_url is not None:
+        if not data_url["mimeType"].lower().startswith("image/"):
+            raise GatewayError(
+                reason="bad_request",
+                retryable=False,
+                provider_message_safe="image_url embedding part requires image data URL",
+                request_id=request_id,
+                provider_called=False,
+            )
         return {"inlineData": data_url}
 
     raise GatewayError(
@@ -176,6 +196,28 @@ def _image_part(image_url: Any, *, request_id: str) -> dict[str, Any]:
     )
 
 
+def _inline_data_part(inline_data: Any, *, request_id: str) -> dict[str, Any]:
+    if not isinstance(inline_data, dict):
+        raise GatewayError(
+            reason="bad_request",
+            retryable=False,
+            provider_message_safe="inline_data part requires object payload",
+            request_id=request_id,
+            provider_called=False,
+        )
+    mime_type = str(inline_data.get("mime_type") or inline_data.get("mimeType") or "").strip()
+    data = str(inline_data.get("data") or "").strip()
+    if not mime_type or not data:
+        raise GatewayError(
+            reason="bad_request",
+            retryable=False,
+            provider_message_safe="inline_data part requires mime_type and data",
+            request_id=request_id,
+            provider_called=False,
+        )
+    return {"inlineData": {"mimeType": mime_type, "data": data}}
+
+
 def _parse_data_url(url: str) -> dict[str, str] | None:
     match = _DATA_URL_PATTERN.match(url)
     if match is None:
@@ -184,9 +226,13 @@ def _parse_data_url(url: str) -> dict[str, str] | None:
     if not data:
         return None
     return {
-        "mimeType": match.group("mime") or "image/jpeg",
+        "mimeType": (match.group("mime") or "image/jpeg").strip(),
         "data": data,
     }
+
+
+def _request_has_inline_data(request: GatewayEmbeddingRequest) -> bool:
+    return any(part.type == "inline_data" for part in request.input)
 
 
 def _to_gateway_embedding_response(

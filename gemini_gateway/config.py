@@ -45,6 +45,7 @@ class GeminiGatewaySettings(BaseSettings):
     openrouter_api_key: SecretStr | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_embeddings_fallback_enabled: bool = False
+    openrouter_embeddings_direct_only_enabled: bool = False
     openrouter_embeddings_fallback_model: str = "google/gemini-embedding-2"
 
     @field_validator("postgres_dsn")
@@ -105,8 +106,10 @@ class GeminiGatewaySettings(BaseSettings):
 
     @model_validator(mode="after")
     def reject_placeholders_outside_dev(self) -> "GeminiGatewaySettings":
-        if self.openrouter_embeddings_fallback_enabled and self.openrouter_api_key is None:
-            raise ValueError("openrouter fallback requires openrouter_api_key")
+        if (
+            self.openrouter_embeddings_fallback_enabled or self.openrouter_embeddings_direct_only_enabled
+        ) and self.openrouter_api_key is None:
+            raise ValueError("openrouter embeddings require openrouter_api_key")
 
         secrets = [self.hmac_key, self.internal_auth_token, self.encryption_key]
         if self.openrouter_api_key is not None:

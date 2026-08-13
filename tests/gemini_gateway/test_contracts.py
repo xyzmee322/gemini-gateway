@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from gemini_gateway.contracts import (
     GatewayChatRequest,
+    GatewayEmbeddingInputPart,
     GatewayEmbeddingResponse,
     GatewayRouteMetadata,
     RouteCandidate,
@@ -196,6 +197,46 @@ def test_embedding_response_allows_empty_default_route_metadata() -> None:
     )
 
     assert response.route == {}
+
+
+def test_embedding_input_part_accepts_inline_audio_data() -> None:
+    part = GatewayEmbeddingInputPart.model_validate(
+        {
+            "type": "inline_data",
+            "inline_data": {"mimeType": " audio/wav ", "data": " UklGRg== "},
+        }
+    )
+
+    assert part.inline_data == {"mime_type": "audio/wav", "data": "UklGRg=="}
+    assert part.model_dump(mode="python", exclude_none=True) == {
+        "type": "inline_data",
+        "inline_data": {"mime_type": "audio/wav", "data": "UklGRg=="},
+    }
+
+
+def test_embedding_input_part_rejects_non_image_data_url_image_url() -> None:
+    with pytest.raises(ValidationError):
+        GatewayEmbeddingInputPart.model_validate(
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:audio/wav;base64,UklGRg=="},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "inline_data"},
+        {"type": "inline_data", "inline_data": {}},
+        {"type": "inline_data", "inline_data": {"mime_type": "audio/wav"}},
+        {"type": "inline_data", "inline_data": {"mimeType": "audio/wav", "data": "   "}},
+        {"type": "inline_data", "inline_data": {"mime_type": "   ", "data": "UklGRg=="}},
+    ],
+)
+def test_embedding_input_part_rejects_inline_data_without_payload(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        GatewayEmbeddingInputPart.model_validate(payload)
 
 
 def test_route_transport_schema_is_proxy_only_for_gemini_routes() -> None:

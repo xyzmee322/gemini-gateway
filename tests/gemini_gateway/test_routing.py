@@ -116,14 +116,16 @@ class _RouteFailureRepository:
 class _RecordingGeminiEmbeddingClient:
     def __init__(self) -> None:
         self.called = False
+        self.calls: list[dict[str, Any]] = []
 
     async def embed(
         self,
         request: GatewayEmbeddingRequest,
         api_key: str,
-        proxy_url: str,
+        proxy_url: str | None,
     ) -> GatewayEmbeddingResponse:
         self.called = True
+        self.calls.append({"request": request, "api_key": api_key, "proxy_url": proxy_url})
         return GatewayEmbeddingResponse(
             request_id=request.request_id,
             model=request.model,
@@ -1291,6 +1293,110 @@ async def test_completion_service_cools_down_route_when_proxy_fails() -> None:
 
     [route] = await repository.list_route_candidates("gemini-3.5-flash", datetime.now(tz=UTC))
     assert route.cooldown_until is not None
+
+
+@pytest.mark.asyncio
+async def test_completion_service_uses_openrouter_embedding_direct_only_without_gemini_routes() -> None:
+    repository = _AcquireRecordingRepository()
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    request = _embedding_request(request_id="req-openrouter-direct-only")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=None,
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_direct_only_enabled=True,
+        environment="test",
+    )
+
+    response = await service.embed(request)
+
+    assert repository.acquire_called is False
+    assert repository.failures == []
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert response.route.model_dump(mode="json", exclude_none=True) == {
+        "project_label": "openrouter-direct",
+        "route_label": "openrouter-embedding-direct",
+        "key_label": "openrouter-api-key",
+        "transport_mode": "direct",
+    }
+    assert response.project_label == "openrouter-direct"
+    assert response.route_label == "openrouter-embedding-direct"
+    assert response.key_label == "openrouter-api-key"
+    assert response.proxy_label is None
+    assert response.transport_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_uses_openrouter_direct_only_for_inline_audio_without_gemini_routes() -> None:
+    repository = _AcquireRecordingRepository()
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    request = GatewayEmbeddingRequest(
+        request_id="req-inline-audio-native-direct-only",
+        source_service="media_memory",
+        model=_OPENROUTER_EMBEDDING_MODEL,
+        input=[
+            {
+                "type": "inline_data",
+                "inline_data": {"mime_type": "audio/wav", "data": "UklGRg=="},
+            },
+        ],
+        dimensions=1536,
+    )
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=None,
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_direct_only_enabled=True,
+        environment="test",
+    )
+
+    response = await service.embed(request)
+
+    assert repository.acquire_called is False
+    assert repository.failures == []
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert response.route_label == "openrouter-embedding-direct"
+    assert response.transport_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_uses_openrouter_fallback_for_inline_audio_embedding() -> None:
+    repository = _RouteFailureRepository("no_route")
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=_RecordingGeminiEmbeddingClient(),
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    request = GatewayEmbeddingRequest(
+        request_id="req-inline-audio-openrouter-fallback",
+        source_service="media_memory",
+        model=_OPENROUTER_EMBEDDING_MODEL,
+        input=[
+            {
+                "type": "inline_data",
+                "inline_data": {"mime_type": "audio/wav", "data": "UklGRg=="},
+            },
+        ],
+        dimensions=1536,
+    )
+
+    response = await service.embed(request)
+
+    assert openrouter_client.calls == [
+        {"request": request, "api_key": _OPENROUTER_API_KEY}
+    ]
+    assert response.route_label == "openrouter-embedding-fallback"
+    assert response.transport_mode == "direct"
 
 
 @pytest.mark.asyncio

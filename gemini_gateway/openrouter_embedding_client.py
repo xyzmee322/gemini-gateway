@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 import httpx
@@ -22,6 +23,35 @@ _CONTENT_FILTER_MARKERS = (
     "blocked",
     "prohibited",
 )
+_MIME_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
+_AUDIO_FORMATS = {
+    "audio/aac": "aac",
+    "audio/flac": "flac",
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "audio/webm": "webm",
+    "audio/x-wav": "wav",
+}
+_FILE_EXTENSIONS = {
+    "application/json": "json",
+    "application/octet-stream": "bin",
+    "application/pdf": "pdf",
+    "text/csv": "csv",
+    "text/html": "html",
+    "text/markdown": "md",
+    "text/plain": "txt",
+}
+
+
+def _data_url_mime_type(url: str) -> str | None:
+    normalized_url = url.strip()
+    if not normalized_url.lower().startswith("data:"):
+        return None
+    metadata = normalized_url[5:].split(",", maxsplit=1)[0]
+    mime_type = metadata.split(";", maxsplit=1)[0].strip().lower()
+    return mime_type or "image/jpeg"
 
 
 class OpenRouterEmbeddingClient:
@@ -103,6 +133,7 @@ class OpenRouterEmbeddingClient:
                 request_id=request.request_id,
                 provider_called=True,
             )
+        _raise_for_embedded_error(raw_response, request_id=request.request_id)
 
         return _to_gateway_embedding_response(request=request, raw_response=raw_response)
 
@@ -122,6 +153,8 @@ def _embedding_payload(request: GatewayEmbeddingRequest) -> dict[str, Any]:
 def _content_part(part: GatewayEmbeddingInputPart, *, request_id: str) -> dict[str, Any]:
     if part.type == "text":
         return {"type": "text", "text": part.text}
+    if part.type == "inline_data":
+        return _inline_data_content_part(part.inline_data, request_id=request_id)
     image_url = part.image_url
     if not isinstance(image_url, dict):
         raise GatewayError(
@@ -131,7 +164,94 @@ def _content_part(part: GatewayEmbeddingInputPart, *, request_id: str) -> dict[s
             request_id=request_id,
             provider_called=False,
         )
+    url = str(image_url.get("url") or "").strip()
+    mime_type = _data_url_mime_type(url)
+    if mime_type is not None and not mime_type.startswith("image/"):
+        raise GatewayError(
+            reason="bad_request",
+            retryable=False,
+            provider_message_safe="image_url embedding part requires image data URL",
+            request_id=request_id,
+            provider_called=False,
+        )
     return {"type": "image_url", "image_url": image_url}
+
+
+def _inline_data_content_part(inline_data: Any, *, request_id: str) -> dict[str, Any]:
+    if not isinstance(inline_data, dict):
+        raise _invalid_inline_data_error(request_id)
+
+    mime_type = str(inline_data.get("mime_type") or "").strip().lower()
+    data = str(inline_data.get("data") or "").strip()
+    if not _MIME_TYPE_PATTERN.fullmatch(mime_type) or not data:
+        raise _invalid_inline_data_error(request_id)
+
+    data_url = f"data:{mime_type};base64,{data}"
+    if mime_type.startswith("image/"):
+        return {"type": "image_url", "image_url": {"url": data_url}}
+    if mime_type.startswith("audio/"):
+        return {
+            "type": "input_audio",
+            "input_audio": {
+                "data": data_url,
+                "format": _audio_format(mime_type),
+            },
+        }
+    if mime_type.startswith("video/"):
+        return {"type": "video_url", "video_url": {"url": data_url}}
+    return {
+        "type": "file",
+        "file": {
+            "filename": f"embedding-input.{_file_extension(mime_type)}",
+            "file_data": data_url,
+        },
+    }
+
+
+def _audio_format(mime_type: str) -> str:
+    return _AUDIO_FORMATS.get(mime_type, _safe_mime_subtype(mime_type, default="audio"))
+
+
+def _file_extension(mime_type: str) -> str:
+    return _FILE_EXTENSIONS.get(mime_type, _safe_mime_subtype(mime_type, default="bin"))
+
+
+def _safe_mime_subtype(mime_type: str, *, default: str) -> str:
+    subtype = mime_type.partition("/")[2].removeprefix("x-").split("+", maxsplit=1)[0]
+    normalized = re.sub(r"[^a-z0-9]", "", subtype)
+    return normalized or default
+
+
+def _invalid_inline_data_error(request_id: str) -> GatewayError:
+    return GatewayError(
+        reason="bad_request",
+        retryable=False,
+        provider_message_safe="inline_data embedding part requires valid MIME type and base64 data",
+        request_id=request_id,
+        provider_called=False,
+    )
+
+
+def _raise_for_embedded_error(raw_response: dict[str, Any], *, request_id: str) -> None:
+    error_payload = raw_response.get("error")
+    if not isinstance(error_payload, dict):
+        return
+
+    status_code = first_int_value(error_payload, "code", "status_code") or 502
+    if status_code < 400 or status_code > 599:
+        status_code = 502
+    provider_message = first_string_value(error_payload, "message", "detail", "status")
+    raise GatewayError(
+        reason=_openrouter_error_reason(
+            status_code=status_code,
+            provider_message=provider_message,
+        ),
+        retryable=status_code in _RETRYABLE_STATUS_CODES,
+        provider_status_code=status_code,
+        provider_message_safe=provider_message,
+        request_id=request_id,
+        provider_called=True,
+    )
 
 
 def _to_gateway_embedding_response(

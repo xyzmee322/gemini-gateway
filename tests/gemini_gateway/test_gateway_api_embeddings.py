@@ -152,6 +152,9 @@ def test_gateway_main_wires_embedding_client_into_production_service() -> None:
     assert "openrouter_embeddings_fallback_enabled=settings.openrouter_embeddings_fallback_enabled" in source[
         service_start:service_end
     ]
+    assert "openrouter_embeddings_direct_only_enabled=settings.openrouter_embeddings_direct_only_enabled" in source[
+        service_start:service_end
+    ]
     assert "openrouter_embeddings_fallback_model=settings.openrouter_embeddings_fallback_model" in source[
         service_start:service_end
     ]

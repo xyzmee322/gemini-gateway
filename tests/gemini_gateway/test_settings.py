@@ -88,12 +88,14 @@ def test_gateway_settings_load_openrouter_embedding_fallback_env(monkeypatch: py
     monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
     monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED", "true")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_API_KEY", "sk-or-openrouter-secret-value")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/")
 
     settings = GeminiGatewaySettings()
 
     assert settings.openrouter_embeddings_fallback_enabled is True
+    assert settings.openrouter_embeddings_direct_only_enabled is True
     assert settings.openrouter_api_key is not None
     assert settings.openrouter_api_key.get_secret_value() == "sk-or-openrouter-secret-value"
     assert settings.openrouter_base_url == "https://openrouter.ai/api/v1"
@@ -115,6 +117,22 @@ def test_gateway_settings_reject_enabled_openrouter_fallback_without_key(
         GeminiGatewaySettings()
 
 
+def test_gateway_settings_reject_enabled_openrouter_direct_only_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_API_KEY", "")
+
+    with pytest.raises(ValidationError):
+        GeminiGatewaySettings()
+
+
 def test_gateway_settings_allows_blank_openrouter_key_when_fallback_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -124,6 +142,7 @@ def test_gateway_settings_allows_blank_openrouter_key_when_fallback_disabled(
     monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
     monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED", "false")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_API_KEY", "")
 
     settings = GeminiGatewaySettings()
@@ -157,6 +176,7 @@ def test_gateway_settings_reject_unsupported_openrouter_fallback_model(
     monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
     monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED", "false")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_API_KEY", "")
     monkeypatch.setenv("GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_MODEL", "other/model")
 

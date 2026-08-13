@@ -39,11 +39,22 @@ Seed маршрутов запускается отдельно, когда за
 docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile seed run --rm seed
 ```
 
-## OpenRouter fallback для embeddings
+## OpenRouter для embeddings
 
-Gateway может использовать OpenRouter без proxy только как fallback для `POST /v1/embeddings` и только для модели `google/gemini-embedding-2`.
+Gateway может использовать OpenRouter без proxy для `POST /v1/embeddings` и только для модели `google/gemini-embedding-2`.
 
-Fallback выключен по умолчанию, чтобы случайно не включить платный путь. Для включения:
+Оба режима выключены по умолчанию, чтобы случайно не включить платный путь.
+
+Direct-only режим сразу отправляет `google/gemini-embedding-2` в OpenRouter по `GEMINI_GATEWAY_OPENROUTER_API_KEY`, без Gemini routes и proxy:
+
+В этом режиме одинаково обрабатываются текст, изображения и `inline_data` с изображениями, аудио, видео или файлами. Репозиторий Keyproxy для embedding-запросов не вызывается; аудио передаётся в OpenRouter напрямую.
+
+```powershell
+$env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED="true"
+$env:GEMINI_GATEWAY_OPENROUTER_API_KEY="sk-or-..."
+```
+
+Fallback режим сначала пробует Gemini routes, а OpenRouter включает только после ошибок маршрутов:
 
 ```powershell
 $env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED="true"
@@ -51,7 +62,7 @@ $env:GEMINI_GATEWAY_OPENROUTER_API_KEY="sk-or-..."
 $env:GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS="5"
 ```
 
-Условия срабатывания:
+Условия fallback:
 
 - сначала gateway пытается выполнить запрос через Gemini routes `api_key + proxy`;
 - при retryable provider/transport ошибках gateway берёт следующий route до `GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS`;
@@ -59,7 +70,8 @@ $env:GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS="5"
 - разрешённые причины включают `no_route`, `cooldown_active`, `quota_exhausted`, `network_timeout`, `proxy_failed`, `rate_limited`, `provider_unavailable`;
 - chat completions и TTS никогда не используют OpenRouter fallback.
 
-В ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-fallback`, `route_label: openrouter-embedding-fallback`.
+В direct-only ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-direct`, `route_label: openrouter-embedding-direct`.
+В fallback ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-fallback`, `route_label: openrouter-embedding-fallback`.
 
 ## Перенос данных из Soybob V3
 

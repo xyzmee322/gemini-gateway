@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-from gemini_gateway.contracts import GatewayEmbeddingRequest
+from gemini_gateway.contracts import GatewayEmbeddingInputPart, GatewayEmbeddingRequest
 from gemini_gateway.errors import GatewayError
 from gemini_gateway.openrouter_embedding_client import OpenRouterEmbeddingClient
 
@@ -80,6 +80,122 @@ async def test_openrouter_embedding_client_posts_direct_payload_and_parses_respo
     assert response.dimensions == 1536
     assert response.usage == {"prompt_tokens": 3, "total_tokens": 3}
     assert response.raw_response["id"] == "gen-openrouter-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mime_type", "data", "expected_content"),
+    [
+        (
+            "image/png",
+            "iVBORw==",
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw=="},
+            },
+        ),
+        (
+            "audio/wav",
+            "UklGRg==",
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": "data:audio/wav;base64,UklGRg==",
+                    "format": "wav",
+                },
+            },
+        ),
+        (
+            "video/mp4",
+            "AAAAIGZ0eXA=",
+            {
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AAAAIGZ0eXA="},
+            },
+        ),
+        (
+            "application/pdf",
+            "JVBERi0=",
+            {
+                "type": "file",
+                "file": {
+                    "filename": "embedding-input.pdf",
+                    "file_data": "data:application/pdf;base64,JVBERi0=",
+                },
+            },
+        ),
+    ],
+)
+async def test_openrouter_embedding_client_serializes_inline_multimodal_data(
+    mime_type: str,
+    data: str,
+    expected_content: dict[str, Any],
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": [{"embedding": _embedding_values()}]})
+
+    client = OpenRouterEmbeddingClient(
+        base_url="https://openrouter.test/api/v1",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.embed(
+        request=GatewayEmbeddingRequest(
+            request_id="req-openrouter-inline-multimodal",
+            source_service="media_memory",
+            model="google/gemini-embedding-2",
+            input=[
+                {
+                    "type": "inline_data",
+                    "inline_data": {"mime_type": mime_type, "data": data},
+                },
+            ],
+        ),
+        api_key="sk-or-secret",
+    )
+
+    assert seen["json"]["input"] == [{"content": [expected_content]}]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_embedding_client_rejects_audio_data_url_image_url_without_provider_call() -> None:
+    called = False
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={"data": [{"embedding": _embedding_values()}]})
+
+    client = OpenRouterEmbeddingClient(
+        base_url="https://openrouter.test/api/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    request = GatewayEmbeddingRequest.model_construct(
+        request_id="req-openrouter-audio-image-url",
+        source_service="media_memory",
+        model="google/gemini-embedding-2",
+        input=[
+            GatewayEmbeddingInputPart.model_construct(
+                type="image_url",
+                image_url={"url": "data:audio/wav;base64,UklGRg=="},
+            )
+        ],
+        dimensions=1536,
+        timeout_seconds=30,
+        chat_id=None,
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.embed(request=request, api_key="sk-or-secret")
+
+    assert called is False
+    assert exc_info.value.reason == "bad_request"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.provider_called is False
+    assert "UklGRg" not in str(exc_info.value.provider_message_safe)
 
 
 @pytest.mark.asyncio
@@ -217,6 +333,35 @@ async def test_openrouter_embedding_client_maps_payment_required_to_quota_exhaus
     assert error.reason == "quota_exhausted"
     assert error.retryable is False
     assert error.provider_status_code == 402
+    assert "sk-or-secret" not in str(error.provider_message_safe)
+
+
+@pytest.mark.asyncio
+async def test_openrouter_embedding_client_maps_error_wrapped_in_success_status() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"error": {"code": 429, "message": "rate limited for sk-or-secret"}},
+        )
+
+    client = OpenRouterEmbeddingClient(base_url="https://openrouter.test/api/v1", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(GatewayError) as exc_info:
+        await client.embed(
+            request=GatewayEmbeddingRequest(
+                request_id="req-openrouter-wrapped-429",
+                source_service="media_memory",
+                model="google/gemini-embedding-2",
+                input=[{"type": "text", "text": "кот"}],
+            ),
+            api_key="sk-or-secret",
+        )
+
+    error = exc_info.value
+    assert error.reason == "rate_limited"
+    assert error.retryable is True
+    assert error.provider_status_code == 429
+    assert error.provider_called is True
     assert "sk-or-secret" not in str(error.provider_message_safe)
 
 

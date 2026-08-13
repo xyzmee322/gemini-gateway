@@ -58,6 +58,10 @@ def test_gateway_compose_wires_openrouter_fallback_env() -> None:
         == "${GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED:-false}"
     )
     assert (
+        environment["GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED"]
+        == "${GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED:-false}"
+    )
+    assert (
         environment["GEMINI_GATEWAY_OPENROUTER_BASE_URL"]
         == "${GEMINI_GATEWAY_OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
     )
@@ -74,6 +78,10 @@ def test_dev_compose_wires_openrouter_fallback_env() -> None:
     assert (
         environment["GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED"]
         == "${GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED:-false}"
+    )
+    assert (
+        environment["GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED"]
+        == "${GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED:-false}"
     )
     assert (
         environment["GEMINI_GATEWAY_OPENROUTER_BASE_URL"]

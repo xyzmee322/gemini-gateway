@@ -49,7 +49,7 @@ class GeminiEmbeddingClient:
     ) -> GatewayEmbeddingResponse:
         if proxy_url is None and not _request_has_inline_data(request):
             _require_proxy_url(proxy_url=proxy_url, request_id=request.request_id)
-        payload = _embedding_payload(request)
+        payload = build_native_embedding_payload(request)
         url = f"{self._base_url}/models/{_to_gemini_model_name(request.model)}:embedContent"
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         try:
@@ -127,7 +127,7 @@ class GeminiEmbeddingClient:
             )
         try:
             _raise_for_embedded_provider_error(raw_response=raw_response, request_id=request.request_id)
-            return _to_gateway_embedding_response(
+            return parse_native_embedding_response(
                 request=request,
                 raw_response=raw_response,
                 provider_timing=provider_timing,
@@ -137,7 +137,7 @@ class GeminiEmbeddingClient:
             raise
 
 
-def _embedding_payload(request: GatewayEmbeddingRequest) -> dict[str, Any]:
+def build_native_embedding_payload(request: GatewayEmbeddingRequest) -> dict[str, Any]:
     return {
         "content": {
             "parts": [
@@ -235,7 +235,7 @@ def _request_has_inline_data(request: GatewayEmbeddingRequest) -> bool:
     return any(part.type == "inline_data" for part in request.input)
 
 
-def _to_gateway_embedding_response(
+def parse_native_embedding_response(
     *,
     request: GatewayEmbeddingRequest,
     raw_response: dict[str, Any],

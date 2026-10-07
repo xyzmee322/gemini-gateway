@@ -198,3 +198,86 @@ def test_gateway_settings_reject_openrouter_base_url_without_host(
 
     with pytest.raises(ValidationError):
         GeminiGatewaySettings()
+
+
+def test_gateway_settings_load_openlux_chat_fallback_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_API_KEY", "sk-openlux-secret-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_BASE_URL", "https://api.openlux.ai/v1/")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_CHAT_MODE", "fallback")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_CHAT_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_PRICING_GROUP", "Anti-Gemini-1")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES", "262144")
+
+    settings = GeminiGatewaySettings()
+
+    assert settings.openlux_api_key is not None
+    assert settings.openlux_api_key.get_secret_value() == "sk-openlux-secret-value"
+    assert settings.openlux_base_url == "https://api.openlux.ai/v1"
+    assert settings.openlux_chat_mode == "fallback"
+    assert settings.openlux_chat_model == "gemini-3.7-flash"
+    assert settings.openlux_pricing_group == "Anti-Gemini-1"
+    assert settings.openlux_max_stream_bytes == 262144
+
+
+def test_gateway_settings_load_openlux_embedding_direct_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_API_KEY", "sk-openlux-secret-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED", "true")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL", "gemini-embedding-2-preview")
+
+    settings = GeminiGatewaySettings()
+
+    assert settings.openlux_embeddings_direct_only_enabled is True
+    assert settings.openlux_embeddings_model == "gemini-embedding-2-preview"
+
+
+def test_gateway_settings_reject_enabled_openlux_embeddings_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_API_KEY", "")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_CHAT_MODE", "off")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="OpenLux features require openlux_api_key"):
+        GeminiGatewaySettings()
+
+
+def test_gateway_settings_reject_enabled_openlux_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_CHAT_MODE", "fallback")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_API_KEY", "")
+
+    with pytest.raises(ValidationError, match="openlux chat requires openlux_api_key"):
+        GeminiGatewaySettings()
+
+
+def test_gateway_settings_rejects_openlux_model_other_than_gemini_3_7_flash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_DSN", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_POSTGRES_SYNC_DSN", "postgresql+psycopg://u:p@localhost/db")
+    monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setenv("GEMINI_GATEWAY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("GEMINI_GATEWAY_INTERNAL_AUTH_TOKEN", "secret-token-value")
+    monkeypatch.setenv("GEMINI_GATEWAY_OPENLUX_CHAT_MODEL", "gpt-5.5-pro")
+
+    with pytest.raises(ValidationError, match="openlux chat is restricted to gemini-3.7-flash"):
+        GeminiGatewaySettings()

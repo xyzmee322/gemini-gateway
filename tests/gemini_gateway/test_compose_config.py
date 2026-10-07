@@ -89,6 +89,48 @@ def test_dev_compose_wires_openrouter_fallback_env() -> None:
     )
 
 
+def test_gateway_compose_wires_openlux_chat_fallback_env() -> None:
+    compose_config = _load_compose_config()
+    environment = _service_environment(compose_config, "gateway")
+
+    assert environment["GEMINI_GATEWAY_OPENLUX_API_KEY"] == "${GEMINI_GATEWAY_OPENLUX_API_KEY:-}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_CHAT_MODE"] == "${GEMINI_GATEWAY_OPENLUX_CHAT_MODE:-off}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_CHAT_MODEL"] == "${GEMINI_GATEWAY_OPENLUX_CHAT_MODEL:-gemini-3.7-flash}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_BASE_URL"] == "${GEMINI_GATEWAY_OPENLUX_BASE_URL:-https://api.openlux.ai/v1}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_PRICING_GROUP"] == "${GEMINI_GATEWAY_OPENLUX_PRICING_GROUP:-Anti-Gemini-1}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES"] == "${GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES:-262144}"
+    assert (
+        environment["GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED"]
+        == "${GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED:-false}"
+    )
+    assert (
+        environment["GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL"]
+        == "${GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL:-gemini-embedding-2-preview}"
+    )
+
+
+def test_dev_compose_wires_openlux_chat_fallback_env() -> None:
+    with (_PROJECT_ROOT / "docker-compose.dev.yml").open(encoding="utf-8") as compose_file:
+        compose_config = yaml.safe_load(compose_file)
+
+    environment = _service_environment(compose_config, "gateway")
+
+    assert environment["GEMINI_GATEWAY_OPENLUX_API_KEY"] == "${GEMINI_GATEWAY_OPENLUX_API_KEY:-}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_CHAT_MODE"] == "${GEMINI_GATEWAY_OPENLUX_CHAT_MODE:-off}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_CHAT_MODEL"] == "${GEMINI_GATEWAY_OPENLUX_CHAT_MODEL:-gemini-3.7-flash}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_BASE_URL"] == "${GEMINI_GATEWAY_OPENLUX_BASE_URL:-https://api.openlux.ai/v1}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_PRICING_GROUP"] == "${GEMINI_GATEWAY_OPENLUX_PRICING_GROUP:-Anti-Gemini-1}"
+    assert environment["GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES"] == "${GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES:-262144}"
+    assert (
+        environment["GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED"]
+        == "${GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED:-false}"
+    )
+    assert (
+        environment["GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL"]
+        == "${GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL:-gemini-embedding-2-preview}"
+    )
+
+
 def test_readme_documents_dev_compose_overlay_command() -> None:
     readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 

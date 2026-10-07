@@ -255,6 +255,8 @@ class GatewayChatResponse(BaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
     route: GatewayRouteMetadata | dict[str, Any] = Field(default_factory=dict)
     generation_id: str | None = None
+    provider_request_id: str | None = None
+    pricing_snapshot_json: dict[str, Any] | None = None
     finish_reason: str | None = None
     provider_specific_fields: dict[str, Any] = Field(default_factory=dict)
     provider_timing: dict[str, Any] = Field(default_factory=dict, exclude=True)
@@ -326,6 +328,7 @@ class GatewayErrorResponse(BaseModel):
     reason: GatewayErrorReason
     error_code: str | None = None
     retryable: bool
+    provider_called: bool | None = None
     retry_after_seconds: int | None = Field(default=None, gt=0)
     quota_scope: Literal["minute", "day"] | None = None
     quota_reset_at: str | None = None

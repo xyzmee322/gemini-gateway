@@ -11,6 +11,9 @@ from gemini_gateway.embedding_client import GeminiEmbeddingClient
 from gemini_gateway.gemini_client import GeminiOpenAIClient
 from gemini_gateway.http_client_pool import GatewayHttpClientPool
 from gemini_gateway.openrouter_embedding_client import OpenRouterEmbeddingClient
+from gemini_gateway.openlux_chat_client import OpenLuxChatClient
+from gemini_gateway.openlux_embedding_client import OpenLuxEmbeddingClient
+from gemini_gateway.openlux_pricing import OpenLuxPricingCatalog
 from gemini_gateway.repository import PostgresGatewayRepository
 from gemini_gateway.retention import GatewayRetentionService
 from gemini_gateway.security import SecretVault
@@ -53,9 +56,31 @@ def build_app():
         base_url=settings.openrouter_base_url,
         timeout=settings.default_request_timeout_seconds,
     )
+    openlux_pricing_catalog = OpenLuxPricingCatalog(
+        group=settings.openlux_pricing_group,
+        base_url=settings.openlux_base_url,
+        timeout_seconds=settings.openlux_pricing_timeout_seconds,
+        cache_ttl_seconds=settings.openlux_pricing_cache_seconds,
+    )
+    openlux_chat_client = OpenLuxChatClient(
+        base_url=settings.openlux_base_url,
+        timeout=settings.default_request_timeout_seconds,
+        max_stream_bytes=settings.openlux_max_stream_bytes,
+        cooldown_seconds=settings.openlux_cooldown_seconds,
+        pricing_catalog=openlux_pricing_catalog,
+    )
+    openlux_embedding_client = OpenLuxEmbeddingClient(
+        base_url=settings.openlux_base_url,
+        timeout=settings.default_request_timeout_seconds,
+    )
     openrouter_api_key = (
         settings.openrouter_api_key.get_secret_value()
         if settings.openrouter_api_key is not None
+        else None
+    )
+    openlux_api_key = (
+        settings.openlux_api_key.get_secret_value()
+        if settings.openlux_api_key is not None
         else None
     )
     service = CompletionService(
@@ -68,6 +93,13 @@ def build_app():
         openrouter_embeddings_fallback_enabled=settings.openrouter_embeddings_fallback_enabled,
         openrouter_embeddings_direct_only_enabled=settings.openrouter_embeddings_direct_only_enabled,
         openrouter_embeddings_fallback_model=settings.openrouter_embeddings_fallback_model,
+        openlux_embedding_client=openlux_embedding_client,
+        openlux_chat_client=openlux_chat_client,
+        openlux_api_key=openlux_api_key,
+        openlux_embeddings_direct_only_enabled=settings.openlux_embeddings_direct_only_enabled,
+        openlux_embeddings_model=settings.openlux_embeddings_model,
+        openlux_chat_mode=settings.openlux_chat_mode,
+        openlux_chat_model=settings.openlux_chat_model,
         max_route_attempts=settings.max_route_attempts,
         service_name=settings.service_name,
         environment=settings.environment,
@@ -91,8 +123,10 @@ def build_app():
     retention_task: asyncio.Task[None] | None = None
 
     @app.on_event("startup")
-    async def start_retention() -> None:
+    async def start_background_services() -> None:
         nonlocal retention_task
+        if settings.openlux_chat_mode != "off":
+            await openlux_pricing_catalog.get_snapshot(settings.openlux_chat_model)
         retention_task = asyncio.create_task(retention_service.run_periodically(retention_stop_event))
 
     @app.on_event("shutdown")
@@ -101,6 +135,7 @@ def build_app():
         if retention_task is not None:
             await retention_task
         await http_client_pool.aclose()
+        await openlux_pricing_catalog.aclose()
         await engine.dispose()
 
     return app

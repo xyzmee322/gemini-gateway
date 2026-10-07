@@ -123,6 +123,7 @@ class GatewayError(RuntimeError):
             reason=self.reason,
             error_code=self.error_code,
             retryable=self.retryable,
+            provider_called=False if self.provider_called is False else None,
             retry_after_seconds=self.retry_after_seconds,
             quota_scope=self.quota_scope,
             quota_reset_at=_serialize_gateway_time(self.quota_reset_at),

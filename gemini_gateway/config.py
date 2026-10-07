@@ -47,6 +47,17 @@ class GeminiGatewaySettings(BaseSettings):
     openrouter_embeddings_fallback_enabled: bool = False
     openrouter_embeddings_direct_only_enabled: bool = False
     openrouter_embeddings_fallback_model: str = "google/gemini-embedding-2"
+    openlux_api_key: SecretStr | None = None
+    openlux_base_url: str = "https://api.openlux.ai/v1"
+    openlux_chat_mode: Literal["off", "fallback", "direct_only"] = "off"
+    openlux_chat_model: str = "gemini-3.7-flash"
+    openlux_embeddings_direct_only_enabled: bool = False
+    openlux_embeddings_model: str = "gemini-embedding-2-preview"
+    openlux_pricing_group: str = "Anti-Gemini-1"
+    openlux_max_stream_bytes: int = Field(default=262_144, ge=16_384, le=16_777_216)
+    openlux_pricing_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    openlux_pricing_cache_seconds: float = Field(default=300.0, ge=1.0, le=86_400.0)
+    openlux_cooldown_seconds: int = Field(default=30, ge=1, le=3600)
 
     @field_validator("postgres_dsn")
     @classmethod
@@ -68,23 +79,23 @@ class GeminiGatewaySettings(BaseSettings):
         Fernet(value.get_secret_value().encode("ascii"))
         return value
 
-    @field_validator("openrouter_api_key", mode="before")
+    @field_validator("openrouter_api_key", "openlux_api_key", mode="before")
     @classmethod
-    def normalize_optional_openrouter_key(cls, value: Any) -> Any:
+    def normalize_optional_provider_key(cls, value: Any) -> Any:
         if value is None:
             return None
         if isinstance(value, str) and not value.strip():
             return None
         return value
 
-    @field_validator("openrouter_api_key")
+    @field_validator("openrouter_api_key", "openlux_api_key")
     @classmethod
-    def validate_optional_openrouter_key(cls, value: SecretStr | None) -> SecretStr | None:
+    def validate_optional_provider_key(cls, value: SecretStr | None) -> SecretStr | None:
         if value is None:
             return None
         raw_value = value.get_secret_value().strip()
         if len(raw_value) < 16:
-            raise ValueError("openrouter_api_key must be at least 16 characters")
+            raise ValueError("provider api key must be at least 16 characters")
         return SecretStr(raw_value)
 
     @field_validator("openrouter_base_url")
@@ -96,6 +107,15 @@ class GeminiGatewaySettings(BaseSettings):
             raise ValueError("openrouter_base_url must be an absolute URL")
         return normalized
 
+    @field_validator("openlux_base_url")
+    @classmethod
+    def normalize_openlux_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed_url = urlsplit(normalized)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise ValueError("openlux_base_url must be an absolute URL")
+        return normalized
+
     @field_validator("openrouter_embeddings_fallback_model")
     @classmethod
     def validate_openrouter_fallback_model(cls, value: str) -> str:
@@ -104,16 +124,46 @@ class GeminiGatewaySettings(BaseSettings):
             raise ValueError("openrouter fallback is restricted to google/gemini-embedding-2")
         return normalized
 
+    @field_validator("openlux_chat_model")
+    @classmethod
+    def validate_openlux_chat_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized != "gemini-3.7-flash":
+            raise ValueError("openlux chat is restricted to gemini-3.7-flash")
+        return normalized
+
+    @field_validator("openlux_embeddings_model")
+    @classmethod
+    def validate_openlux_embeddings_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized != "gemini-embedding-2-preview":
+            raise ValueError("OpenLux embeddings are restricted to gemini-embedding-2-preview")
+        return normalized
+
+    @field_validator("openlux_pricing_group")
+    @classmethod
+    def normalize_openlux_pricing_group(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("openlux_pricing_group must not be blank")
+        return normalized
+
     @model_validator(mode="after")
     def reject_placeholders_outside_dev(self) -> "GeminiGatewaySettings":
         if (
             self.openrouter_embeddings_fallback_enabled or self.openrouter_embeddings_direct_only_enabled
         ) and self.openrouter_api_key is None:
             raise ValueError("openrouter embeddings require openrouter_api_key")
+        if self.openlux_chat_mode != "off" and self.openlux_api_key is None:
+            raise ValueError("openlux chat requires openlux_api_key")
+        if self.openlux_embeddings_direct_only_enabled and self.openlux_api_key is None:
+            raise ValueError("OpenLux features require openlux_api_key")
 
         secrets = [self.hmac_key, self.internal_auth_token, self.encryption_key]
         if self.openrouter_api_key is not None:
             secrets.append(self.openrouter_api_key)
+        if self.openlux_api_key is not None:
+            secrets.append(self.openlux_api_key)
 
         if self.environment == "development":
             return self

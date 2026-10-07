@@ -32,6 +32,10 @@ from gemini_gateway.service import CompletionService
 
 _OPENROUTER_EMBEDDING_MODEL = "google/gemini-embedding-2"
 _OPENROUTER_API_KEY = "sk-or-test-openrouter-secret"
+_OPENLUX_API_KEY = "sk-openlux-test-secret"
+_OPENLUX_MODEL = "gemini-3.8-flash"
+_OPENLUX_GATE_MODEL = "gemini-3.1-flash-lite"
+_OPENLUX_EMBEDDING_MODEL = "gemini-embedding-2-preview"
 
 
 def _candidate(
@@ -153,6 +157,49 @@ class _RecordingOpenRouterEmbeddingClient:
             embedding=[0.2] * request.dimensions,
             dimensions=request.dimensions,
             usage={"prompt_tokens": 3, "total_tokens": 3},
+        )
+
+
+class _RecordingOpenLuxEmbeddingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def embed(
+        self,
+        *,
+        request: GatewayEmbeddingRequest,
+        api_key: str,
+        model: str,
+    ) -> GatewayEmbeddingResponse:
+        self.calls.append({"request": request, "api_key": api_key, "model": model})
+        return GatewayEmbeddingResponse(
+            request_id=request.request_id,
+            model=request.model,
+            embedding=[0.3] * request.dimensions,
+            dimensions=request.dimensions,
+            usage={"prompt_tokens": 2, "total_tokens": 2},
+        )
+
+
+class _RecordingOpenLuxChatClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def complete(
+        self,
+        *,
+        request: GatewayChatRequest,
+        api_key: str,
+        model: str,
+    ) -> GatewayChatResponse:
+        self.calls.append({"request": request, "api_key": api_key, "model": model})
+        return GatewayChatResponse(
+            request_id=request.request_id,
+            generation_id="gen-openlux-chat",
+            provider_request_id="openlux-request-test",
+            model=model,
+            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "cost": 0.000001},
         )
 
 
@@ -802,6 +849,126 @@ async def test_completion_service_retries_retryable_chat_failure_on_next_route()
 
 
 @pytest.mark.asyncio
+async def test_completion_service_uses_openlux_chat_fallback_when_routes_are_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = _RouteFailureRepository("no_route")
+    openlux_client = _RecordingOpenLuxChatClient()
+    request = GatewayChatRequest(
+        request_id="req-openlux-chat-fallback",
+        source_service="test",
+        model="google/gemini-3.8-flash",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        openlux_chat_client=openlux_client,
+        openlux_api_key=_OPENLUX_API_KEY,
+        openlux_chat_mode="fallback",
+        openlux_chat_model=_OPENLUX_MODEL,
+        environment="test",
+    )
+    caplog.set_level(logging.INFO, logger="gemini_gateway.service")
+
+    response = await service.complete(request)
+
+    assert openlux_client.calls == [
+        {"request": request, "api_key": _OPENLUX_API_KEY, "model": _OPENLUX_MODEL}
+    ]
+    assert response.model == _OPENLUX_MODEL
+    assert response.route.model_dump(mode="json", exclude_none=True) == {
+        "project_label": "openlux-fallback",
+        "route_label": "openlux-chat-fallback",
+        "key_label": "openlux-api-key",
+        "transport_mode": "direct",
+    }
+    success_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "status", None) == "success"
+        and getattr(record, "fallback_provider", None) == "openlux"
+    ]
+    assert len(success_records) == 1
+    assert success_records[0].cost_usd == 0.000001
+    assert success_records[0].provider_request_id == "openlux-request-test"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_uses_openlux_chat_direct_only_without_acquiring_route() -> None:
+    repository = _AcquireRecordingRepository()
+    openlux_client = _RecordingOpenLuxChatClient()
+    request = GatewayChatRequest(
+        request_id="req-openlux-chat-direct",
+        source_service="test",
+        model="google/gemini-3.1-flash-lite",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        openlux_chat_client=openlux_client,
+        openlux_api_key=_OPENLUX_API_KEY,
+        openlux_chat_mode="direct_only",
+        openlux_chat_model=_OPENLUX_MODEL,
+        environment="test",
+    )
+
+    response = await service.complete(request)
+
+    assert repository.acquire_called is False
+    assert openlux_client.calls == [
+        {"request": request, "api_key": _OPENLUX_API_KEY, "model": _OPENLUX_GATE_MODEL}
+    ]
+    assert response.model == _OPENLUX_GATE_MODEL
+    assert response.route_label == "openlux-chat-direct"
+    assert response.project_label == "openlux-direct"
+    assert response.transport_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_does_not_bypass_content_filter_with_openlux() -> None:
+    class _FilteredClient:
+        async def complete(
+            self,
+            request: GatewayChatRequest,
+            api_key: str,
+            proxy_url: str,
+        ) -> GatewayChatResponse:
+            del api_key, proxy_url
+            raise GatewayError(
+                reason="content_filtered",
+                retryable=False,
+                request_id=request.request_id,
+                provider_called=True,
+            )
+
+    openlux_client = _RecordingOpenLuxChatClient()
+    service = CompletionService(
+        repository=InMemoryRouteRepository([_candidate("filtered")]),
+        gemini_client=_FilteredClient(),
+        openlux_chat_client=openlux_client,
+        openlux_api_key=_OPENLUX_API_KEY,
+        openlux_chat_mode="fallback",
+        openlux_chat_model=_OPENLUX_MODEL,
+        environment="test",
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(
+            GatewayChatRequest(
+                request_id="req-openlux-no-safety-bypass",
+                source_service="test",
+                model="gemini-3.5-flash",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+
+    assert exc_info.value.reason == "content_filtered"
+    assert openlux_client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_completion_service_does_not_retry_non_retryable_chat_error() -> None:
     class _Client:
         def __init__(self) -> None:
@@ -1326,6 +1493,93 @@ async def test_completion_service_uses_openrouter_embedding_direct_only_without_
     assert response.key_label == "openrouter-api-key"
     assert response.proxy_label is None
     assert response.transport_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_completion_service_uses_openlux_embedding_direct_without_gemini_routes() -> None:
+    repository = _AcquireRecordingRepository()
+    openlux_client = _RecordingOpenLuxEmbeddingClient()
+    request = _embedding_request(request_id="req-openlux-embedding-direct")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=None,
+        openlux_embedding_client=openlux_client,
+        openlux_api_key=_OPENLUX_API_KEY,
+        openlux_embeddings_direct_only_enabled=True,
+        openlux_embeddings_model=_OPENLUX_EMBEDDING_MODEL,
+        environment="test",
+    )
+
+    response = await service.embed(request)
+
+    assert repository.acquire_called is False
+    assert openlux_client.calls == [
+        {
+            "request": request,
+            "api_key": _OPENLUX_API_KEY,
+            "model": _OPENLUX_EMBEDDING_MODEL,
+        }
+    ]
+    assert response.route.model_dump(mode="json", exclude_none=True) == {
+        "project_label": "openlux-direct",
+        "route_label": "openlux-embedding-direct",
+        "key_label": "openlux-api-key",
+        "transport_mode": "direct",
+    }
+
+
+@pytest.mark.asyncio
+async def test_completion_service_falls_back_to_openrouter_after_openlux_embedding_failure() -> None:
+    class _FailingOpenLuxEmbeddingClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def embed(
+            self,
+            *,
+            request: GatewayEmbeddingRequest,
+            api_key: str,
+            model: str,
+        ) -> GatewayEmbeddingResponse:
+            self.calls.append({"request": request, "api_key": api_key, "model": model})
+            raise GatewayError(
+                reason="rate_limited",
+                retryable=True,
+                request_id=request.request_id,
+                provider_called=True,
+            )
+
+    repository = _AcquireRecordingRepository()
+    openlux_client = _FailingOpenLuxEmbeddingClient()
+    openrouter_client = _RecordingOpenRouterEmbeddingClient()
+    request = _embedding_request(request_id="req-openlux-to-openrouter")
+    service = CompletionService(
+        repository=repository,
+        gemini_client=object(),
+        embedding_client=None,
+        openlux_embedding_client=openlux_client,
+        openlux_api_key=_OPENLUX_API_KEY,
+        openlux_embeddings_direct_only_enabled=True,
+        openlux_embeddings_model=_OPENLUX_EMBEDDING_MODEL,
+        openrouter_embedding_client=openrouter_client,
+        openrouter_api_key=_OPENROUTER_API_KEY,
+        openrouter_embeddings_fallback_enabled=True,
+        environment="test",
+    )
+
+    response = await service.embed(request)
+
+    assert repository.acquire_called is False
+    assert openlux_client.calls == [
+        {
+            "request": request,
+            "api_key": _OPENLUX_API_KEY,
+            "model": _OPENLUX_EMBEDDING_MODEL,
+        }
+    ]
+    assert openrouter_client.calls == [{"request": request, "api_key": _OPENROUTER_API_KEY}]
+    assert response.route_label == "openrouter-embedding-fallback"
 
 
 @pytest.mark.asyncio

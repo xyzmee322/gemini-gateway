@@ -1199,6 +1199,7 @@ def _gateway_error_route_context(error: GatewayError) -> dict[str, str | None]:
 
 def _gateway_error_diagnostics(error: GatewayError) -> dict[str, Any]:
     return {
+        "provider_called": False if getattr(error, "provider_called", None) is False else None,
         "error_code": _optional_string(getattr(error, "error_code", None)),
         "quota_scope": _optional_string(getattr(error, "quota_scope", None)),
         "quota_reset_at": _serialize_error_time(getattr(error, "quota_reset_at", None)),

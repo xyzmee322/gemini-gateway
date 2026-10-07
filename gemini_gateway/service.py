@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any, TypeVar
 
 from core.number_parsing import parse_optional_int as _safe_int
+from core.string_parsing import parse_optional_string as _safe_string
 from core.wide_events import build_wide_event
 from gemini_gateway.contracts import (
     GatewayChatRequest,
@@ -44,6 +45,7 @@ _OPENROUTER_EMBEDDING_FALLBACK_REASONS = frozenset(
         "network_timeout",
         "provider_unavailable",
         "request_failed",
+        "invalid_response",
     }
 )
 _OPENROUTER_EMBEDDING_FALLBACK_STAGE = "openrouter_embedding_fallback"
@@ -51,6 +53,26 @@ _OPENROUTER_EMBEDDING_DIRECT_STAGE = "openrouter_embedding_direct"
 _OPENROUTER_FALLBACK_PROVIDER = "openrouter"
 _OPENROUTER_ROUTING_MODE_FALLBACK = "fallback"
 _OPENROUTER_ROUTING_MODE_DIRECT_ONLY = "direct_only"
+_OPENLUX_EMBEDDING_DIRECT_STAGE = "openlux_embedding_direct"
+_OPENLUX_EMBEDDING_ROUTING_MODE_DIRECT_ONLY = "direct_only"
+_OPENLUX_CHAT_FALLBACK_REASONS = frozenset(
+    {
+        "no_route",
+        "cooldown_active",
+        "quota_exhausted",
+        "rate_limited",
+        "proxy_failed",
+        "network_timeout",
+        "provider_unavailable",
+        "request_failed",
+    }
+)
+_OPENLUX_CHAT_FALLBACK_STAGE = "openlux_chat_fallback"
+_OPENLUX_CHAT_DIRECT_STAGE = "openlux_chat_direct"
+_OPENLUX_FALLBACK_PROVIDER = "openlux"
+_OPENLUX_ROUTING_MODE_FALLBACK = "fallback"
+_OPENLUX_ROUTING_MODE_DIRECT_ONLY = "direct_only"
+_OPENLUX_PASSTHROUGH_CHAT_MODELS = frozenset({"gemini-3.1-flash-lite"})
 _DEFAULT_MAX_ROUTE_ATTEMPTS = 5
 
 
@@ -69,6 +91,13 @@ class CompletionService:
         openrouter_embeddings_fallback_enabled: bool = False,
         openrouter_embeddings_direct_only_enabled: bool = False,
         openrouter_embeddings_fallback_model: str = _OPENROUTER_EMBEDDING_FALLBACK_MODEL,
+        openlux_embedding_client: Any | None = None,
+        openlux_chat_client: Any | None = None,
+        openlux_api_key: str | None = None,
+        openlux_embeddings_direct_only_enabled: bool = False,
+        openlux_embeddings_model: str = "gemini-embedding-2-preview",
+        openlux_chat_mode: str = "off",
+        openlux_chat_model: str = "gemini-3.7-flash",
         max_route_attempts: int = _DEFAULT_MAX_ROUTE_ATTEMPTS,
         service_name: str = "gemini-gateway",
         environment: str = "development",
@@ -82,20 +111,137 @@ class CompletionService:
         self._openrouter_embeddings_fallback_enabled = openrouter_embeddings_fallback_enabled
         self._openrouter_embeddings_direct_only_enabled = openrouter_embeddings_direct_only_enabled
         self._openrouter_embeddings_fallback_model = openrouter_embeddings_fallback_model
+        self._openlux_embedding_client = openlux_embedding_client
+        self._openlux_chat_client = openlux_chat_client
+        self._openlux_api_key = _normalize_optional_secret(openlux_api_key)
+        self._openlux_embeddings_direct_only_enabled = openlux_embeddings_direct_only_enabled
+        self._openlux_embeddings_model = openlux_embeddings_model
+        self._openlux_chat_mode = openlux_chat_mode
+        self._openlux_chat_model = openlux_chat_model
         self._max_route_attempts = max(1, int(max_route_attempts))
         self._service_name = service_name
         self._environment = environment
 
     async def complete(self, request: GatewayChatRequest | dict[str, Any]) -> GatewayChatResponse:
         gateway_request = _ensure_request(request)
-        return await self._execute_with_route_retries(
-            request=gateway_request,
-            provider_call=lambda attempt_request, lease: self._gemini_client.complete(
-                request=attempt_request,
-                api_key=lease.api_key,
-                proxy_url=lease.proxy_url,
-            ),
+        if self._openlux_chat_mode == _OPENLUX_ROUTING_MODE_DIRECT_ONLY:
+            return await self._execute_openlux_chat_direct(gateway_request)
+        try:
+            return await self._execute_with_route_retries(
+                request=gateway_request,
+                provider_call=lambda attempt_request, lease: self._gemini_client.complete(
+                    request=attempt_request,
+                    api_key=lease.api_key,
+                    proxy_url=lease.proxy_url,
+                ),
+            )
+        except GatewayError as error:
+            if not self._should_use_openlux_chat_fallback(error):
+                raise
+            return await self._execute_openlux_chat_fallback(gateway_request)
+
+    def _should_use_openlux_chat_fallback(self, error: GatewayError) -> bool:
+        return (
+            self._openlux_chat_mode == _OPENLUX_ROUTING_MODE_FALLBACK
+            and self._openlux_chat_client is not None
+            and self._openlux_api_key is not None
+            and error.retryable
+            and error.reason in _OPENLUX_CHAT_FALLBACK_REASONS
         )
+
+    async def _execute_openlux_chat_direct(self, request: GatewayChatRequest) -> GatewayChatResponse:
+        return await self._execute_openlux_chat(
+            request=request,
+            route_metadata=_openlux_direct_route_metadata(),
+            failed_stage=_OPENLUX_CHAT_DIRECT_STAGE,
+            routing_mode=_OPENLUX_ROUTING_MODE_DIRECT_ONLY,
+        )
+
+    async def _execute_openlux_chat_fallback(self, request: GatewayChatRequest) -> GatewayChatResponse:
+        return await self._execute_openlux_chat(
+            request=request,
+            route_metadata=_openlux_fallback_route_metadata(),
+            failed_stage=_OPENLUX_CHAT_FALLBACK_STAGE,
+            routing_mode=_OPENLUX_ROUTING_MODE_FALLBACK,
+        )
+
+    async def _execute_openlux_chat(
+        self,
+        *,
+        request: GatewayChatRequest,
+        route_metadata: GatewayRouteMetadata,
+        failed_stage: str,
+        routing_mode: str,
+    ) -> GatewayChatResponse:
+        started_at = perf_counter()
+        client = self._openlux_chat_client
+        api_key = self._openlux_api_key
+        if client is None or api_key is None:
+            error = GatewayError(
+                reason="provider_unavailable",
+                retryable=True,
+                request_id=request.request_id,
+            )
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_chat_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
+            raise error
+
+        try:
+            response = await client.complete(
+                request=request,
+                api_key=api_key,
+                model=_resolve_openlux_chat_model(
+                    requested_model=request.model,
+                    default_model=self._openlux_chat_model,
+                ),
+            )
+            response = _attach_response_route_metadata(response, route_metadata)
+            self._log_openlux_chat_success(
+                request,
+                response,
+                _elapsed_ms(started_at),
+                route_metadata,
+                routing_mode,
+            )
+            return response
+        except GatewayError as error:
+            _set_request_id(error, request.request_id)
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_chat_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
+            raise
+        except Exception as exc:
+            error = GatewayError(
+                reason="request_failed",
+                retryable=True,
+                provider_message_safe="openlux_chat_error",
+                request_id=request.request_id,
+                status_code=500,
+            )
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_chat_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+                failed_stage,
+                routing_mode,
+            )
+            raise error from exc
+
 
     async def synthesize_speech(self, request: GatewayTTSRequest | dict[str, Any]) -> GatewayTTSResponse:
         gateway_request = _ensure_tts_request(request)
@@ -116,6 +262,13 @@ class CompletionService:
 
     async def embed(self, request: GatewayEmbeddingRequest | dict[str, Any]) -> GatewayEmbeddingResponse:
         gateway_request = _ensure_embedding_request(request)
+        if self._should_use_openlux_embedding_direct_only(gateway_request):
+            try:
+                return await self._execute_openlux_embedding_direct(gateway_request)
+            except GatewayError as error:
+                if not self._should_use_openrouter_embedding_fallback(request=gateway_request, error=error):
+                    raise
+                return await self._execute_openrouter_embedding_fallback(gateway_request)
         if self._should_use_openrouter_embedding_direct_only(gateway_request):
             return await self._execute_openrouter_embedding_direct(gateway_request)
         if self._embedding_client is None:
@@ -133,6 +286,76 @@ class CompletionService:
             if not self._should_use_openrouter_embedding_fallback(request=gateway_request, error=error):
                 raise
             return await self._execute_openrouter_embedding_fallback(gateway_request)
+
+    def _should_use_openlux_embedding_direct_only(self, request: GatewayEmbeddingRequest) -> bool:
+        return (
+            self._openlux_embeddings_direct_only_enabled
+            and request.model == self._openrouter_embeddings_fallback_model
+        )
+
+    async def _execute_openlux_embedding_direct(
+        self,
+        request: GatewayEmbeddingRequest,
+    ) -> GatewayEmbeddingResponse:
+        started_at = perf_counter()
+        route_metadata = _openlux_embedding_direct_route_metadata()
+        client = self._openlux_embedding_client
+        api_key = self._openlux_api_key
+        if client is None or api_key is None:
+            error = GatewayError(
+                reason="provider_unavailable",
+                retryable=True,
+                request_id=request.request_id,
+            )
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_embedding_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+            )
+            raise error
+
+        try:
+            response = await client.embed(
+                request=request,
+                api_key=api_key,
+                model=self._openlux_embeddings_model,
+            )
+            response = _attach_response_route_metadata(response, route_metadata)
+            self._log_openlux_embedding_success(
+                request,
+                response,
+                _elapsed_ms(started_at),
+                route_metadata,
+            )
+            return response
+        except GatewayError as error:
+            _set_request_id(error, request.request_id)
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_embedding_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+            )
+            raise
+        except Exception as exc:
+            error = GatewayError(
+                reason="request_failed",
+                retryable=True,
+                provider_message_safe="openlux_embedding_error",
+                request_id=request.request_id,
+                status_code=500,
+            )
+            _attach_error_metadata(error, route_metadata, overwrite=True)
+            self._log_openlux_embedding_failure(
+                request,
+                error,
+                _elapsed_ms(started_at),
+                route_metadata,
+            )
+            raise error from exc
 
     async def _embed_with_gemini_route(
         self,
@@ -406,6 +629,85 @@ class CompletionService:
             event["fallback_provider"] = _OPENROUTER_FALLBACK_PROVIDER
         _LOGGER.warning("gemini_gateway_request", extra=event)
 
+    def _log_openlux_embedding_success(
+        self,
+        request: GatewayEmbeddingRequest,
+        response: GatewayEmbeddingResponse,
+        latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+    ) -> None:
+        event = self._base_event(
+            request=request,
+            lease=None,
+            latency_ms=latency_ms,
+            status="success",
+            route_metadata=route_metadata,
+        )
+        event.update(_success_log_fields(response))
+        event["openlux_routing_mode"] = _OPENLUX_EMBEDDING_ROUTING_MODE_DIRECT_ONLY
+        _LOGGER.info("gemini_gateway_request", extra=event)
+
+    def _log_openlux_embedding_failure(
+        self,
+        request: GatewayEmbeddingRequest,
+        error: GatewayError,
+        latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+    ) -> None:
+        event = self._base_event(
+            request=request,
+            lease=None,
+            latency_ms=latency_ms,
+            status="error",
+            route_metadata=route_metadata,
+        )
+        event.update(_failure_log_fields(error, _OPENLUX_EMBEDDING_DIRECT_STAGE))
+        event["openlux_routing_mode"] = _OPENLUX_EMBEDDING_ROUTING_MODE_DIRECT_ONLY
+        _LOGGER.warning("gemini_gateway_request", extra=event)
+
+    def _log_openlux_chat_success(
+        self,
+        request: GatewayChatRequest,
+        response: GatewayChatResponse,
+        latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+        routing_mode: str,
+    ) -> None:
+        event = self._base_event(
+            request=request,
+            lease=None,
+            latency_ms=latency_ms,
+            status="success",
+            route_metadata=route_metadata,
+        )
+        event.update(_success_log_fields(response))
+        event["openlux_routing_mode"] = routing_mode
+        if routing_mode == _OPENLUX_ROUTING_MODE_FALLBACK:
+            event["fallback_provider"] = _OPENLUX_FALLBACK_PROVIDER
+        _LOGGER.info("gemini_gateway_request", extra=event)
+
+    def _log_openlux_chat_failure(
+        self,
+        request: GatewayChatRequest,
+        error: GatewayError,
+        latency_ms: int,
+        route_metadata: GatewayRouteMetadata,
+        failed_stage: str,
+        routing_mode: str,
+    ) -> None:
+        event = self._base_event(
+            request=request,
+            lease=None,
+            latency_ms=latency_ms,
+            status="error",
+            route_metadata=route_metadata,
+        )
+        event.update(_failure_log_fields(error, failed_stage))
+        event["openlux_routing_mode"] = routing_mode
+        if routing_mode == _OPENLUX_ROUTING_MODE_FALLBACK:
+            event["fallback_provider"] = _OPENLUX_FALLBACK_PROVIDER
+        _LOGGER.warning("gemini_gateway_request", extra=event)
+
     def _base_event(
         self,
         *,
@@ -438,6 +740,15 @@ class CompletionService:
             duration_ms=latency_ms,
             retry_count=getattr(request, "retry_count", 0),
         )
+
+
+def _resolve_openlux_chat_model(*, requested_model: str, default_model: str) -> str:
+    """Сохраняет разрешённые model id, иначе использует OpenLux-модель по умолчанию."""
+
+    provider_model = requested_model.strip().removeprefix("google/")
+    if provider_model in _OPENLUX_PASSTHROUGH_CHAT_MODELS:
+        return provider_model
+    return default_model
 
 
 def create_default_service(
@@ -580,6 +891,36 @@ def _openrouter_direct_route_metadata() -> GatewayRouteMetadata:
     )
 
 
+def _openlux_embedding_direct_route_metadata() -> GatewayRouteMetadata:
+    return GatewayRouteMetadata(
+        project_label="openlux-direct",
+        route_label="openlux-embedding-direct",
+        key_label="openlux-api-key",
+        proxy_label=None,
+        transport_mode="direct",
+    )
+
+
+def _openlux_fallback_route_metadata() -> GatewayRouteMetadata:
+    return GatewayRouteMetadata(
+        project_label="openlux-fallback",
+        route_label="openlux-chat-fallback",
+        key_label="openlux-api-key",
+        proxy_label=None,
+        transport_mode="direct",
+    )
+
+
+def _openlux_direct_route_metadata() -> GatewayRouteMetadata:
+    return GatewayRouteMetadata(
+        project_label="openlux-direct",
+        route_label="openlux-chat-direct",
+        key_label="openlux-api-key",
+        proxy_label=None,
+        transport_mode="direct",
+    )
+
+
 def _route_metadata_to_dict(route_metadata: Any) -> dict[str, Any]:
     if isinstance(route_metadata, GatewayRouteMetadata):
         return route_metadata.model_dump(mode="python")
@@ -618,7 +959,10 @@ def _success_log_fields(response: GatewayProviderResponse) -> dict[str, Any]:
         "prompt_tokens": _safe_int(usage.get("prompt_tokens")),
         "completion_tokens": _safe_int(usage.get("completion_tokens")),
         "total_tokens": _safe_int(usage.get("total_tokens")),
+        "cost_usd": _safe_non_negative_float(usage.get("cost")),
         "generation_id": response.generation_id,
+        "provider_request_id": _bounded_log_string(getattr(response, "provider_request_id", None)),
+        "provider_model": _bounded_log_string(response.model),
         "finish_reason": response.finish_reason,
         "error_type": None,
         "error_message": None,
@@ -635,6 +979,25 @@ def _success_log_fields(response: GatewayProviderResponse) -> dict[str, Any]:
     }
     fields.update(provider_timing_columns(getattr(response, "provider_timing", None)))
     return fields
+
+
+def _safe_non_negative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result < 0 or result == float("inf") or result == float("-inf") or result != result:
+        return None
+    return result
+
+
+def _bounded_log_string(value: Any, *, max_length: int = 160) -> str | None:
+    normalized = _safe_string(value)
+    if normalized is None:
+        return None
+    return normalized[:max_length]
 
 
 def _failure_log_fields(error: GatewayError, failed_stage: str) -> dict[str, Any]:

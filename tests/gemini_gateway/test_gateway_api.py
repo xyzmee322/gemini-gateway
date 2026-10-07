@@ -97,6 +97,17 @@ class _FailingService:
         )
 
 
+class _CircuitOpenService:
+    async def complete(self, request: Any) -> GatewayChatResponse:
+        raise GatewayError(
+            reason="cooldown_active",
+            retryable=True,
+            retry_after_seconds=23,
+            provider_called=False,
+            request_id=request.request_id,
+        )
+
+
 class _RoutedFailingService:
     async def complete(self, request: Any) -> GatewayChatResponse:
         error = GatewayError(
@@ -344,6 +355,7 @@ def test_tts_api_gateway_error_handler_returns_stable_safe_json() -> None:
         "error": "Сейчас нет доступного маршрута для Gemini, попробуй позже",
         "reason": "no_route",
         "retryable": True,
+        "provider_called": False,
     }
     assert "raw route details" not in response.text
     assert "provider_timing" not in response.json()
@@ -379,6 +391,25 @@ def test_api_gateway_error_handler_returns_stable_safe_json() -> None:
     assert "provider_timing" not in response.json()
     assert "Bearer leaked" not in response.text
     assert "raw failure body" not in response.text
+
+
+def test_api_gateway_error_reports_when_provider_was_not_called() -> None:
+    app = create_app(auth_token="secret-token", completion_service=_CircuitOpenService())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-token"},
+        json={
+            "request_id": "req-circuit-open",
+            "source_service": "test",
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.json()["provider_called"] is False
 
 
 def test_api_gateway_error_handler_includes_safe_route_context() -> None:
@@ -455,6 +486,7 @@ def test_api_gateway_error_handler_returns_quota_exhausted_diagnostics() -> None
         "reason": "quota_exhausted",
         "error_code": "quota_exhausted",
         "retryable": True,
+        "provider_called": False,
         "retry_after_seconds": 3600,
         "quota_scope": "day",
         "quota_reset_at": "2026-06-09T00:00:00Z",

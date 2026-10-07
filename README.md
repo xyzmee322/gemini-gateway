@@ -73,6 +73,44 @@ $env:GEMINI_GATEWAY_MAX_ROUTE_ATTEMPTS="5"
 В direct-only ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-direct`, `route_label: openrouter-embedding-direct`.
 В fallback ответе route metadata будет `transport_mode: direct`, `project_label: openrouter-fallback`, `route_label: openrouter-embedding-fallback`.
 
+## OpenLux для embeddings
+
+OpenLux может быть primary transport для внешнего model id `google/gemini-embedding-2`. Gateway сохраняет этот id в ответе и metadata, но отправляет провайдеру `gemini-embedding-2-preview`, поэтому существующий Qdrant-индекс не меняет embedding identity.
+
+```powershell
+$env:GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_DIRECT_ONLY_ENABLED="true"
+$env:GEMINI_GATEWAY_OPENLUX_EMBEDDINGS_MODEL="gemini-embedding-2-preview"
+$env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_DIRECT_ONLY_ENABLED="false"
+$env:GEMINI_GATEWAY_OPENROUTER_EMBEDDINGS_FALLBACK_ENABLED="true"
+```
+
+Одиночный text input отправляется в OpenAI-compatible `POST /v1/embeddings`. Image и смешанный input отправляются в native `POST /v1beta/models/gemini-embedding-2-preview:embedContent` с camelCase-полями `inlineData.mimeType` и `outputDimensionality`. При retryable ошибке OpenLux запрос один раз переключается на OpenRouter. Route metadata primary-ответа: `project_label: openlux-direct`, `route_label: openlux-embedding-direct`.
+
+## OpenLux fallback для chat
+
+Gateway поддерживает отдельный OpenAI-compatible transport OpenLux для `POST /v1/chat/completions`. Он не меняет proxy-only политику основных Gemini routes. Для входной модели `google/gemini-3.1-flash-lite` OpenLux получает `gemini-3.1-flash-lite`; остальные chat-модели используют настроенную модель по умолчанию `gemini-3.7-flash`.
+
+Режимы `GEMINI_GATEWAY_OPENLUX_CHAT_MODE`:
+
+- `off` — OpenLux выключен;
+- `fallback` — сначала используются Gemini routes, затем один вызов OpenLux при исчерпании retryable маршрутов;
+- `direct_only` — аварийный ручной режим, который сразу вызывает OpenLux.
+
+```powershell
+$env:GEMINI_GATEWAY_OPENLUX_API_KEY="sk-..."
+$env:GEMINI_GATEWAY_OPENLUX_CHAT_MODE="fallback"
+$env:GEMINI_GATEWAY_OPENLUX_CHAT_MODEL="gemini-3.7-flash"
+$env:GEMINI_GATEWAY_OPENLUX_PRICING_GROUP="Anti-Gemini-1"
+```
+
+Fallback разрешён для `no_route`, `cooldown_active`, `quota_exhausted`, `rate_limited`, `network_timeout`, `proxy_failed`, `provider_unavailable` и retryable `request_failed`. Ошибки контента, авторизации, невалидного запроса или ответа не переключают провайдера. После retryable ошибки OpenLux клиент открывает локальный cooldown и учитывает `Retry-After`.
+
+Запрос к OpenLux всегда streaming: gateway собирает OpenAI SSE, поддерживает fragmented tool calls и tool continuation, а затем возвращает обычный внутренний non-streaming ответ. `GEMINI_GATEWAY_OPENLUX_MAX_STREAM_BYTES` ограничивает объём ответа на случай, если upstream проигнорирует `max_tokens`.
+
+Стоимость считается по текущим OpenLux/NewAPI ratios из `/api/pricing` для выбранной группы: `input_rate = model_price × group_ratio / 500000`, `output_rate = input_rate × completion_ratio`. Расчёт попадает в `usage.cost`, snapshot тарифа — в `pricing_snapshot_json`, а `x-api-request-id` сохраняется как `provider_request_id` для последующей сверки с billing log.
+
+В fallback ответе route metadata будет `transport_mode: direct`, `project_label: openlux-fallback`, `route_label: openlux-chat-fallback`. В direct-only — `project_label: openlux-direct`, `route_label: openlux-chat-direct`.
+
 ## Перенос данных из Soybob V3
 
 `scripts/clone_gateway_data.sql` рассчитан на сценарий, где старая схема `soybob_v3` и новая схема `gemini_gateway` доступны в одной Postgres-базе. Сначала разверни миграции нового сервиса, затем останови старый gateway traffic и скопируй данные:

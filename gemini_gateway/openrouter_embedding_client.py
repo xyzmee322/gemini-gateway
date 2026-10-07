@@ -135,7 +135,7 @@ class OpenRouterEmbeddingClient:
             )
         _raise_for_embedded_error(raw_response, request_id=request.request_id)
 
-        return _to_gateway_embedding_response(request=request, raw_response=raw_response)
+        return parse_openai_embedding_response(request=request, raw_response=raw_response)
 
 
 def _embedding_payload(request: GatewayEmbeddingRequest) -> dict[str, Any]:
@@ -254,17 +254,18 @@ def _raise_for_embedded_error(raw_response: dict[str, Any], *, request_id: str) 
     )
 
 
-def _to_gateway_embedding_response(
+def parse_openai_embedding_response(
     *,
     request: GatewayEmbeddingRequest,
     raw_response: dict[str, Any],
+    provider_name: str = "OpenRouter",
 ) -> GatewayEmbeddingResponse:
     values = _embedding_values(raw_response)
     if not values:
         raise GatewayError(
             reason="invalid_response",
             retryable=False,
-            provider_message_safe="OpenRouter embedding response does not contain embedding values",
+            provider_message_safe=f"{provider_name} embedding response does not contain embedding values",
             request_id=request.request_id,
             provider_called=True,
         )
@@ -272,7 +273,7 @@ def _to_gateway_embedding_response(
         raise GatewayError(
             reason="invalid_response",
             retryable=False,
-            provider_message_safe="OpenRouter embedding response dimensions do not match requested dimensions",
+            provider_message_safe=f"{provider_name} embedding response dimensions do not match requested dimensions",
             request_id=request.request_id,
             provider_called=True,
         )
